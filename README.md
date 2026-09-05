@@ -50,9 +50,18 @@ across chats, and a manual reachable from inside the chat.
 - **Image editing workflows.** Attach an image; if the workflow has an image
   input (`PIPE_IMAGE` or a `LoadImage` node), the image alone is enough – no
   prompt required.
+- **Aspect ratio from the image.** For workflows with an image input the
+  output format follows the attached image: the pipe reads its dimensions
+  and picks the closest entry from the `ResolutionSelector` (or sets
+  width:height directly for plain latent nodes). An explicit `--ar` always
+  wins; `--arauto 0` switches it off per message or as a saved default,
+  the `auto_ar` user valve per user, `auto_ar_from_image` globally.
 - **Per-model system prompt.** The system prompt of an Open WebUI workspace
   model is prepended to every job. Typed text extends it. Handy for
   "make this cat look like *our* cat" style presets.
+  Blocks Open WebUI itself adds to the system message – attached-file
+  descriptions, the `<memory_context>` block of the memory feature – are
+  stripped first, so memories never leak into the image prompt.
 - **Stop button works.** Cancelling in Open WebUI withdraws the job from
   ComfyUI: pending jobs are deleted from the queue, the running one is
   interrupted (only if it really is ours).
@@ -71,7 +80,9 @@ across chats, and a manual reachable from inside the chat.
   `__metadata__` support – any reasonably recent version)
 - ComfyUI reachable from the Open WebUI container over HTTP
 - Python package `aiohttp` (declared in the function header; Open WebUI
-  installs it)
+  installs it). Pillow is used for reading image dimensions if present
+  (it ships with Open WebUI); without it a small built-in header parser
+  covers PNG, JPEG and WebP.
 - Optional: Ollama for prompt translation; the `ResolutionSelector` custom
   node if you want `--ar` with named presets
 
@@ -96,6 +107,9 @@ across chats, and a manual reachable from inside the chat.
    - `PIPE_PROMPT_RESULT` – a text output node whose result (e.g. a refined
      prompt) is shown under the image
    - `PIPE_LOCK …` – on a LoRA loader: fixed, not exposed as `--loraN`
+   - `PIPE_INTERNAL …` – the node is removed from the job before it is
+     sent to ComfyUI (preview/debug outputs that should stay in the
+     canvas and out of the chat; dead-end nodes only)
    - `PIPE_NAME` or `PIPE_NAME:field` – any other node: becomes `--name`
 3. Run the workflow once successfully, then **Workflow → Export (API)**.
    The normal save format is rejected with a clear message.
@@ -123,6 +137,7 @@ LoRA slot numbers can shift, and stale defaults may need a `--reset`.
 | `--anleitung` | Full manual (admins get an extra section) |
 | `--loras`, `--vaes`, `--ars`, … | List options; add a search term to filter |
 | `--reset` | Delete all saved defaults for this workflow |
+| `--arauto 0/1` | Aspect ratio from the attached image off/on (image workflows only) |
 | flags only, no prompt | Save these flags as defaults |
 | `--flag` without value | Reset that one entry (permanently when saving, once when rendering) |
 
@@ -136,10 +151,15 @@ question gets answered.
 **Admin valves** (gear icon on the function): `comfy_url`, `timeout_seconds`,
 `max_batch`, `retry_on_error`, `store_images_as_files`, `ollama_url`,
 `translate_model`, `translate_keep_alive`, `translate_system`,
-`lora_triggers` (one `name_fragment | trigger word` per line).
+`lora_triggers` (one `name_fragment | trigger word` per line),
+`auto_ar_from_image`.
 
 **User valves** (slider icon in the chat): `aspect_ratio`, `megapixels`,
-`batch_size`, `steps`, `seed`, `translate`, `show_prompt`.
+`batch_size`, `steps`, `seed`, `translate`, `show_prompt`, `auto_ar`.
+
+Precedence for the aspect ratio: `--ar` in the message or saved defaults
+> attached image (if `auto_ar` is on) > `aspect_ratio` user valve >
+workflow file.
 
 ## Storage locations
 

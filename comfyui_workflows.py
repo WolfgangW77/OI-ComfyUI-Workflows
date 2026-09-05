@@ -1,7 +1,7 @@
 """
 title: OI-ComfyUI-Workflows
 author: Wolfgang Weber (WolfgangW77)
-version: 0.11.1
+version: 0.12.2
 license: MIT
 description: Exposes every API-format workflow in a directory as its own 
 model. Controlled via flags in the prompt (--ar, --no, --steps ...), 
@@ -138,6 +138,36 @@ v0.11.1
   publication; MIT license notice added to the header. No functional
   change. User-facing texts (help, manual, status and error messages)
   remain in German.
+
+v0.12.0
+- Automatic aspect ratio from the attached image: for workflows with an
+  image input (PIPE_IMAGE / LoadImage) the pipe reads the dimensions of
+  the attached image and picks the aspect ratio closest to it - from the
+  ResolutionSelector's option list if the workflow has one, otherwise
+  directly as width:height for plain width/height nodes. Only applies
+  when no --ar was given (message or saved defaults); an explicit --ar
+  always wins, and so does the image over the aspect_ratio user valve.
+  Switchable: admin valve auto_ar_from_image (global), user valve
+  auto_ar, flag --arauto 0/1 (message or saved default). The info line
+  marks the result with "(aus Bild WxH)".
+- Image dimensions are read from the file header (PNG, JPEG, WebP) with
+  Pillow as the first choice if available; no new dependency.
+
+v0.12.1
+- Open WebUI's memory feature appends a <memory_context>...</memory_context>
+  block to the system message (utils/memory.py, present since 0.11.0).
+  The pipe prepends the system message to the image prompt, so the
+  memories ended up in the prompt unless memory was switched off per
+  model. The block is now stripped like the other wrapper blocks; the
+  info line reports it ("Gedächtnis-Block aus dem Systemprompt entfernt").
+
+v0.12.2
+- New marker PIPE_INTERNAL: a node with this title prefix is removed
+  from the job before it is sent to ComfyUI. Meant for preview/debug
+  outputs (e.g. a depth-map preview) that belong in the ComfyUI canvas
+  but not in the chat - ComfyUI does not even compute them. Only nodes
+  no other node depends on may be marked; otherwise the node stays in
+  the job and --help shows a warning. --help lists the removed nodes.
 """
 
 import asyncio
@@ -163,6 +193,7 @@ TITLE_NEGATIVE = "PIPE_NEGATIVE"
 TITLE_IMAGE = "PIPE_IMAGE"
 TITLE_LOCK = "PIPE_LOCK"
 TITLE_RESULT = "PIPE_PROMPT_RESULT"
+TITLE_INTERNAL = "PIPE_INTERNAL"  # node is dropped from the job (dead ends only)
 TITLE_PREFIX = "PIPE_"
 
 DEFAULT_TRANSLATE_SYSTEM = (
@@ -204,6 +235,7 @@ WRAPPER_TAGS = (
     "file",
     "chat_history",
     "user_context",
+    "memory_context",  # Open WebUI memory feature, appended to the system message
 )
 WRAPPER_RE = re.compile(
     r"<(" + "|".join(WRAPPER_TAGS) + r")\b[^>]*>.*?</\1\s*>|<(?:"
@@ -358,6 +390,14 @@ class Pipe:
                 "aber nur für LoRAs mit Stärke ungleich 0."
             ),
         )
+        auto_ar_from_image: bool = Field(
+            default=True,
+            description=(
+                "Bei Workflows mit Bildeingang das Seitenverhältnis automatisch aus dem "
+                "angehängten Bild ableiten, wenn kein --ar angegeben ist. Aus = Funktion "
+                "für alle Benutzer abgeschaltet."
+            ),
+        )
 
     class UserValves(BaseModel):
         aspect_ratio: str = Field(
@@ -377,6 +417,13 @@ class Pipe:
         )
         show_prompt: bool = Field(
             default=False, description="Verwendete Einstellungen unter das Bild schreiben."
+        )
+        auto_ar: bool = Field(
+            default=True,
+            description=(
+                "Seitenverhältnis aus dem angehängten Bild übernehmen, wenn kein --ar "
+                "angegeben ist (nur Workflows mit Bildeingang)."
+            ),
         )
 
     def __init__(self):
@@ -424,8 +471,36 @@ class Pipe:
     # ------------------------------------------------------------------
 
     def _analyze(self, wf: dict) -> dict:
-        h: dict = {"loras": [], "markers": {}}
+        h: dict = {"loras": [], "markers": {}, "internal": []}
+
+        # PIPE_INTERNAL first: such nodes must not register as outputs,
+        # LoRA slots or markers below. A node that another node depends
+        # on cannot be dropped - it stays, with a note for --help.
         for node_id in sorted(wf.keys(), key=_node_sort_key):
+            title = (wf[node_id].get("_meta") or {}).get("title", "")
+            if not title.startswith(TITLE_INTERNAL):
+                continue
+            dependants = [
+                other_id
+                for other_id, other in wf.items()
+                if other_id != node_id
+                and any(
+                    isinstance(v, list) and v and str(v[0]) == str(node_id)
+                    for v in other.get("inputs", {}).values()
+                )
+            ]
+            if dependants:
+                h.setdefault("marker_errors", []).append(
+                    f"Knoten {node_id} ({wf[node_id].get('class_type', '?')}) ist als "
+                    f"{TITLE_INTERNAL} markiert, aber Knoten "
+                    f"{', '.join(dependants)} hängen davon ab — bleibt im Auftrag"
+                )
+            else:
+                h["internal"].append(node_id)
+
+        for node_id in sorted(wf.keys(), key=_node_sort_key):
+            if node_id in h["internal"]:
+                continue
             node = wf[node_id]
             ctype = node.get("class_type", "")
             title = (node.get("_meta") or {}).get("title", "")
@@ -545,6 +620,78 @@ class Pipe:
             return _combo_options(spec)
         except Exception:
             return []
+
+    def _image_size(self, raw: bytes) -> Optional[tuple[int, int]]:
+        """Pixel dimensions of an image file. Pillow first (present in Open
+        WebUI), otherwise a minimal header parser for PNG, JPEG and WebP."""
+        try:
+            from PIL import Image as _Image
+            import io as _io
+
+            with _Image.open(_io.BytesIO(raw)) as im:
+                w, hh = im.size
+                # EXIF orientation 5-8 = rotated by 90 degrees: swap
+                try:
+                    if im.getexif().get(0x0112, 1) in (5, 6, 7, 8):
+                        w, hh = hh, w
+                except Exception:
+                    pass
+                return (int(w), int(hh)) if w and hh else None
+        except Exception:
+            pass
+        try:
+            if raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR":
+                return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+            if raw[:2] == b"\xff\xd8":
+                i = 2
+                while i + 9 < len(raw):
+                    if raw[i] != 0xFF:
+                        i += 1
+                        continue
+                    marker = raw[i + 1]
+                    if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                        i += 2
+                        continue
+                    length = int.from_bytes(raw[i + 2 : i + 4], "big")
+                    if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                                  0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                        hh = int.from_bytes(raw[i + 5 : i + 7], "big")
+                        w = int.from_bytes(raw[i + 7 : i + 9], "big")
+                        return (w, hh) if w and hh else None
+                    i += 2 + length
+            if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+                chunk = raw[12:16]
+                if chunk == b"VP8X":
+                    w = 1 + int.from_bytes(raw[24:27], "little")
+                    hh = 1 + int.from_bytes(raw[27:30], "little")
+                    return w, hh
+                if chunk == b"VP8L":
+                    b = raw[21:25]
+                    w = 1 + (b[0] | ((b[1] & 0x3F) << 8))
+                    hh = 1 + ((b[1] >> 6) | (b[2] << 2) | ((b[3] & 0x0F) << 10))
+                    return w, hh
+                if chunk == b"VP8 ":
+                    w = int.from_bytes(raw[26:28], "little") & 0x3FFF
+                    hh = int.from_bytes(raw[28:30], "little") & 0x3FFF
+                    return (w, hh) if w and hh else None
+        except Exception:
+            pass
+        return None
+
+    def _nearest_ratio_option(self, options: list[str], width: int, height: int) -> Optional[str]:
+        """The ResolutionSelector entry whose ratio is closest to
+        width:height (compared on a log scale, so 2:1 and 1:2 are equally
+        far from 1:1)."""
+        target = math.log(width / height)
+        best, best_d = None, None
+        for opt in options:
+            ratio = self._aspect(opt.split(" ")[0])
+            if not ratio:
+                continue
+            d = abs(math.log(ratio) - target)
+            if best_d is None or d < best_d:
+                best, best_d = opt, d
+        return best
 
     # ------------------------------------------------------------------
     # Setting values
@@ -724,12 +871,15 @@ class Pipe:
                 continue
         return found
 
-    def _system_prompt(self, body: dict) -> str:
+    def _system_prompt(self, body: dict) -> tuple[str, bool]:
         """Fetch the workspace model's system prompt from the messages.
 
         Assumption (Open WebUI default behaviour): the system prompt stored
         in the model is passed as a message with role 'system' at the start
         of the messages array. The first such message is used.
+
+        Returns: (system prompt without wrapper blocks, whether Open WebUI's
+        memory block was part of it).
         """
         for msg in body.get("messages") or []:
             if msg.get("role") != "system":
@@ -739,8 +889,10 @@ class Pipe:
                 content = "\n".join(
                     p.get("text", "") for p in content if p.get("type") == "text"
                 )
-            return _strip_wrappers(str(content))
-        return ""
+            content = str(content)
+            had_memory = "<memory_context" in content
+            return _strip_wrappers(content), had_memory
+        return "", False
 
     async def _upload_image(self, session, base: str, raw: bytes, filename: str):
         """Upload an image to ComfyUI. Returns: (reference, error text)."""
@@ -1017,7 +1169,7 @@ class Pipe:
         # Not via _known_flags, because that already contains the listing flags
         taken = {
             "help", "no", "seed", "steps", "cfg", "guidance", "batch", "ar", "mp",
-            "translate", "triggers", "loras", "reset", "anleitung",
+            "translate", "triggers", "loras", "reset", "anleitung", "arauto",
         }
         taken |= {f"lora{i}" for i in range(1, len(h["loras"]) + 1)}
         taken |= set(h["markers"])
@@ -1038,6 +1190,7 @@ class Pipe:
         known = {
             "help", "no", "seed", "steps", "cfg", "guidance",
             "batch", "ar", "mp", "translate", "triggers", "loras", "reset",
+            "arauto",
         }
         known |= {f"lora{i}" for i in range(1, len(h["loras"]) + 1)}
         known |= set(h["markers"])
@@ -1129,6 +1282,7 @@ Gedankenstrich funktionieren beide.
 | `--cfg 2` | CFG-Wert -- bei Turbo-Modellen auf 1 lassen! |
 | `--guidance 2.5` | FluxGuidance (nur Flux) |
 | `--translate 0/1` | Übersetzung für diese Nachricht aus/an |
+| `--arauto 0/1` | Format aus dem angehängten Bild ableiten aus/an (nur Workflows mit Bildeingang) |
 | `--triggers 0/1` | Automatische Triggerwörter aus/an |
 
 Dazu je Workflow eigene Kürzel aus `PIPE_*`-Knoten (z.B. `--refine`,
@@ -1161,8 +1315,9 @@ Vorgaben des Workflows.
 ## Chat-Steuerung (Schieberegler-Symbol)
 
 `translate` (Übersetzung dauerhaft an), `show_prompt` (Info-Zeile
-unter dem Bild -- anfangs anschalten!), `seed`, `steps`,
-`aspect_ratio`, `megapixels`, `batch_size`.
+unter dem Bild -- anfangs anschalten!), `auto_ar` (Format aus dem
+angehängten Bild), `seed`, `steps`, `aspect_ratio`, `megapixels`,
+`batch_size`.
 
 ## Gut zu wissen
 
@@ -1173,7 +1328,10 @@ unter dem Bild -- anfangs anschalten!), `seed`, `steps`,
 - Ein gelungenes Bild reproduzieren: Seed aus der Info-Zeile ablesen
   und per `--seed` wiederverwenden.
 - Der Stopp-Knopf zieht den Auftrag auch bei ComfyUI zurück -- wartende
-  Aufträge werden gelöscht, laufende unterbrochen."""
+  Aufträge werden gelöscht, laufende unterbrochen.
+- Bei Workflows mit Bildeingang folgt das Format dem angehängten Foto
+  (nächstliegendes Seitenverhältnis), solange kein `--ar` gesetzt ist.
+  `--ar` gewinnt immer; `--arauto 0` schaltet es ab."""
 
         if not is_admin:
             return text
@@ -1188,8 +1346,11 @@ unter dem Bild -- anfangs anschalten!), `seed`, `steps`,
 
 1. In ComfyUI den Knoten, der den Prompt-Text aufnimmt, in `PIPE_PROMPT`
    umbenennen. Optional: `PIPE_NEGATIVE`, `PIPE_IMAGE` (Bildeingang),
-   `PIPE_LOCK …` (LoRA aus der Nummerierung nehmen) und beliebige
-   `PIPE_NAME`- bzw. `PIPE_NAME:feldname`-Marker, die zu Kürzeln werden.
+   `PIPE_LOCK …` (LoRA aus der Nummerierung nehmen), `PIPE_INTERNAL …`
+   (Knoten wird vor dem Auftrag entfernt — für Vorschau-Knoten, die nur
+   in ComfyUI sichtbar sein sollen; nur an Knoten ohne Abnehmer) und
+   beliebige `PIPE_NAME`- bzw. `PIPE_NAME:feldname`-Marker, die zu
+   Kürzeln werden.
 2. Workflow einmal erfolgreich laufen lassen, dann
    **Workflow → Export (API)** — nicht das normale Speichern.
 3. Datei ins Workflow-Verzeichnis legen (siehe Ablageorte unten).
@@ -1209,7 +1370,8 @@ danach ggf. `--reset`.
 `comfy_url`, `timeout_seconds`, `max_batch` (Obergrenze für `--batch`),
 `ollama_url`, `translate_model`, `translate_keep_alive`,
 `translate_system` (verträgt ein Glossar), `lora_triggers`
-(`fragment | triggerwort` je Zeile), `store_images_as_files`.
+(`fragment | triggerwort` je Zeile), `store_images_as_files`,
+`auto_ar_from_image` (Format aus dem angehängten Bild, global an/aus).
 
 ## Ablageorte
 
@@ -1249,6 +1411,11 @@ automatisch einen Titel aus Zeitstempel und Modellname.
             lines.append(f"- {label}: {'Knoten ' + h[key][0] if h.get(key) else '-'}")
         if h.get("image"):
             lines.append(f"- Bildeingang: Knoten {h['image'][0]} (Foto an die Nachricht anhängen)")
+            if self.valves.auto_ar_from_image:
+                lines.append(
+                    "- `--arauto 1/0` : Seitenverhältnis automatisch aus dem angehängten Bild "
+                    "(gilt nur, wenn kein `--ar` angegeben ist)"
+                )
         if len(h.get("dimension_nodes", [])) > 1:
             lines.append(
                 "- Größe wird gemeinsam gesetzt in: "
@@ -1287,6 +1454,11 @@ automatisch einen Titel aus Zeitstempel und Modellname.
             + (", ".join(f"Knoten {n}" for n in h["outputs"]) if h.get("outputs")
                else "⚠ KEINE — Workflow erzeugt so kein Bild")
         )
+        for nid in h.get("internal", []):
+            lines.append(
+                f"- (intern) Knoten {nid} ({wf[nid].get('class_type', '?')}) wird vor dem "
+                "Auftrag entfernt — nur in ComfyUI sichtbar"
+            )
         for problem in h.get("marker_errors", []):
             lines.append(f"- ⚠ {problem}")
         if self.valves.translate_model:
@@ -1409,6 +1581,12 @@ automatisch einen Titel aus Zeitstempel und Modellname.
         raw = _strip_wrappers(raw)
         prompt, flags = self._parse_flags(raw)
 
+        # PIPE_INTERNAL nodes leave the job here; wf is a fresh copy per
+        # request, so the workflow file stays untouched. --help still
+        # lists them (from h), the job itself never contains them.
+        for nid in h.get("internal", []):
+            wf.pop(nid, None)
+
         if "anleitung" in flags:
             is_admin = str((__user__ or {}).get("role", "")).lower() == "admin"
             return self._manual(is_admin)
@@ -1527,7 +1705,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
         # --- Prepend the model's system prompt permanently ---
         # Deliberately only here: the branches above (help, saving defaults,
         # "Kein Prompt angegeben") still depend on the typed text alone.
-        system_prompt = self._system_prompt(body)
+        system_prompt, had_memory = self._system_prompt(body)
+        if had_memory:
+            used.append("Gedächtnis-Block aus dem Systemprompt entfernt")
         if system_prompt:
             if prompt:
                 prompt = f"{system_prompt.rstrip(' ,.')}, {prompt}"
@@ -1674,6 +1854,35 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                         "(kein PIPE_IMAGE- oder LoadImage-Knoten)"
                     )
 
+                # --- Aspect ratio from the attached image ---
+                # Precedence: --ar (message/defaults) > image > aspect_ratio
+                # user valve > workflow file. Only for workflows with an
+                # image input, and only if switched on at every level.
+                ar_from_image = ""
+                auto_ar = self.valves.auto_ar_from_image and user_valves.auto_ar
+                if "arauto" in flags:
+                    auto_ar = self._coerce(flags["arauto"], True)
+                if auto_ar and h.get("image") and images_in and "ar" not in flags:
+                    size = self._image_size(images_in[0][0])
+                    if not size:
+                        used.append("Format aus Bild: Bildgröße nicht lesbar, Vorgabe bleibt")
+                    elif h.get("resolution"):
+                        options = await self._resolution_options(session, base)
+                        chosen = self._nearest_ratio_option(options, *size) if options else None
+                        if chosen:
+                            flags["ar"] = chosen
+                            ar_from_image = f"{size[0]}x{size[1]}"
+                        else:
+                            used.append(
+                                "Format aus Bild: keine Auswahlliste vom ResolutionSelector, "
+                                "Vorgabe bleibt"
+                            )
+                    elif h.get("dimension_nodes"):
+                        flags["ar"] = f"{size[0]}:{size[1]}"
+                        ar_from_image = f"{size[0]}x{size[1]}"
+                    else:
+                        used.append("Format aus Bild: Workflow hat keine setzbare Größe")
+
                 # --- Validate all values together once ---
                 # The aspect ratio from the chat controls has to pass through
                 # validation too - otherwise "1:1" instead of "1:1 (Square)"
@@ -1753,7 +1962,10 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                     node = wf[h["resolution"]]["inputs"]
                     if ratio_text:
                         node["aspect_ratio"] = ratio_text
-                        used.append(f"Format {ratio_text}")
+                        used.append(
+                            f"Format {ratio_text}"
+                            + (f" (aus Bild {ar_from_image})" if ar_from_image else "")
+                        )
                     if megapixels > 0:
                         node["megapixels"] = megapixels
                         used.append(f"{megapixels} MP")
@@ -1774,6 +1986,8 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                         extra = (
                             f" (in {len(targets)} Knoten gesetzt)" if len(targets) > 1 else ""
                         )
+                        if ar_from_image:
+                            extra += f" (Format aus Bild {ar_from_image})"
                         used.append(f"{w}x{hh}{extra}")
 
                 if not h.get("outputs"):
