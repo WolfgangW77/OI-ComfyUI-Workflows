@@ -1,7 +1,7 @@
 """
 title: OI-ComfyUI-Workflows
 author: Wolfgang Weber (WolfgangW77)
-version: 0.12.2
+version: 0.12.3
 license: MIT
 description: Exposes every API-format workflow in a directory as its own 
 model. Controlled via flags in the prompt (--ar, --no, --steps ...), 
@@ -168,6 +168,12 @@ v0.12.2
   but not in the chat - ComfyUI does not even compute them. Only nodes
   no other node depends on may be marked; otherwise the node stays in
   the job and --help shows a warning. --help lists the removed nodes.
+
+v0.12.3
+- Fix: --help failed with a KeyError (e.g. '30:62') on workflows with a
+  PIPE_INTERNAL node. The node is removed from the job right after the
+  analysis, but the help text looked it up in the job again. The class
+  type is now recorded during the analysis instead.
 """
 
 import asyncio
@@ -471,7 +477,7 @@ class Pipe:
     # ------------------------------------------------------------------
 
     def _analyze(self, wf: dict) -> dict:
-        h: dict = {"loras": [], "markers": {}, "internal": []}
+        h: dict = {"loras": [], "markers": {}, "internal": [], "internal_types": {}}
 
         # PIPE_INTERNAL first: such nodes must not register as outputs,
         # LoRA slots or markers below. A node that another node depends
@@ -497,6 +503,7 @@ class Pipe:
                 )
             else:
                 h["internal"].append(node_id)
+                h["internal_types"][node_id] = wf[node_id].get("class_type", "?")
 
         for node_id in sorted(wf.keys(), key=_node_sort_key):
             if node_id in h["internal"]:
@@ -1455,8 +1462,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                else "⚠ KEINE — Workflow erzeugt so kein Bild")
         )
         for nid in h.get("internal", []):
+            ctype = h.get("internal_types", {}).get(nid, "?")
             lines.append(
-                f"- (intern) Knoten {nid} ({wf[nid].get('class_type', '?')}) wird vor dem "
+                f"- (intern) Knoten {nid} ({ctype}) wird vor dem "
                 "Auftrag entfernt — nur in ComfyUI sichtbar"
             )
         for problem in h.get("marker_errors", []):
