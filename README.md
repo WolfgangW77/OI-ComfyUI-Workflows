@@ -60,8 +60,9 @@ across chats, and a manual reachable from inside the chat.
   model is prepended to every job. Typed text extends it. Handy for
   "make this cat look like *our* cat" style presets.
   Blocks Open WebUI itself adds to the system message – attached-file
-  descriptions, the `<memory_context>` block of the memory feature – are
-  stripped first, so memories never leak into the image prompt.
+  descriptions, the `<memory_context>` block of the memory feature, the
+  `[CONVERSATION SUMMARY]` of Context Compaction – are stripped first, so
+  neither memories nor chat summaries leak into the image prompt.
 - **Stop button works.** Cancelling in Open WebUI withdraws the job from
   ComfyUI: pending jobs are deleted from the queue, the running one is
   interrupted (only if it really is ours).

@@ -1,14 +1,14 @@
 """
 title: OI-ComfyUI-Workflows
 author: Wolfgang Weber (WolfgangW77)
-version: 0.12.3
+version: 0.12.4
 license: MIT
-description: Exposes every API-format workflow in a directory as its own 
-model. Controlled via flags in the prompt (--ar, --no, --steps ...), 
+description: Exposes every API-format workflow in a directory as its own
+model. Controlled via flags in the prompt (--ar, --no, --steps ...),
 optional translation of non-English prompts via Ollama.
 requirements: aiohttp
 
-Written with AI assistance (Claude by Anthropic); reviewed and maintained 
+Written with AI assistance (Claude by Anthropic); reviewed and maintained
 by the author.
 
 Version history
@@ -174,6 +174,20 @@ v0.12.3
   PIPE_INTERNAL node. The node is removed from the job right after the
   analysis, but the help text looked it up in the job again. The class
   type is now recorded during the analysis instead.
+
+v0.12.4
+- Open WebUI's Context Compaction (Admin Settings -> Interface, since
+  0.10.2) writes the chat summary into the system message, prefixed
+  with "[CONVERSATION SUMMARY]" - either replacing the model's system
+  prompt or appended to it (open-webui issue #26710). The pipe treated
+  it as a system prompt and prepended the whole summary to the image
+  prompt. Everything from the marker to the end of the system message
+  is now discarded; text before it (the real system prompt, in the
+  "appended" case) survives. If nothing is left, the next system
+  message is checked. The info line reports it ("Chat-Zusammenfassung
+  (Context Compaction) aus dem Systemprompt entfernt").
+- Image rendering itself was never affected: the pipe only reads the
+  last user message, and compaction only summarises older ones.
 """
 
 import asyncio
@@ -226,8 +240,13 @@ LATENT_TYPES = {"EmptyLatentImage", "EmptySD3LatentImage", "EmptyLatentImagePres
 LORA_TYPES = {"LoraLoader", "LoraLoaderModelOnly"}
 MODEL_EXTS = (".safetensors", ".gguf", ".ckpt", ".pt", ".sft", ".bin")
 IMAGE_OUTPUT_TYPES = {
-    "SaveImage", "PreviewImage", "SaveImageWebsocket", "SaveAnimatedWEBP",
-    "SaveAnimatedPNG", "Image Save", "SaveImageExtended",
+    "SaveImage",
+    "PreviewImage",
+    "SaveImageWebsocket",
+    "SaveAnimatedWEBP",
+    "SaveAnimatedPNG",
+    "Image Save",
+    "SaveImageExtended",
 }
 CFG_FIELDS = {"CFGGuider": "cfg", "KSampler": "cfg", "KSamplerAdvanced": "cfg"}
 
@@ -244,11 +263,17 @@ WRAPPER_TAGS = (
     "memory_context",  # Open WebUI memory feature, appended to the system message
 )
 WRAPPER_RE = re.compile(
-    r"<(" + "|".join(WRAPPER_TAGS) + r")\b[^>]*>.*?</\1\s*>|<(?:"
+    r"<("
+    + "|".join(WRAPPER_TAGS)
+    + r")\b[^>]*>.*?</\1\s*>|<(?:"
     + "|".join(WRAPPER_TAGS)
     + r")\b[^>]*/?>",
     re.S | re.I,
 )
+
+# Open WebUI's Context Compaction puts the chat summary into the system
+# message with this prefix. Not an XML block, so handled separately.
+COMPACTION_MARKER = "[CONVERSATION SUMMARY]"
 
 
 def _strip_wrappers(text: str) -> str:
@@ -407,7 +432,8 @@ class Pipe:
 
     class UserValves(BaseModel):
         aspect_ratio: str = Field(
-            default="", description="Standard-Seitenverhältnis, z.B. 16:9. Leer = wie im Workflow."
+            default="",
+            description="Standard-Seitenverhältnis, z.B. 16:9. Leer = wie im Workflow.",
         )
         megapixels: float = Field(
             default=0.0, description="Bildgröße in Megapixeln. 0 = wie im Workflow."
@@ -415,14 +441,17 @@ class Pipe:
         batch_size: int = Field(
             default=0, description="Bilder pro Anfrage. 0 = wie im Workflow."
         )
-        steps: int = Field(default=0, description="Sampler-Schritte. 0 = wie im Workflow.")
+        steps: int = Field(
+            default=0, description="Sampler-Schritte. 0 = wie im Workflow."
+        )
         seed: int = Field(default=-1, description="Fester Seed. -1 = jedes Mal neu.")
         translate: bool = Field(
             default=False,
             description="Prompt vor dem Rendern ins Englische übersetzen lassen.",
         )
         show_prompt: bool = Field(
-            default=False, description="Verwendete Einstellungen unter das Bild schreiben."
+            default=False,
+            description="Verwendete Einstellungen unter das Bild schreiben.",
         )
         auto_ar: bool = Field(
             default=True,
@@ -520,7 +549,10 @@ class Pipe:
             elif title == TITLE_RESULT:
                 h["prompt_result"] = node_id
             elif title == TITLE_IMAGE:
-                h["image"] = (node_id, "image" if "image" in inputs else next(iter(inputs), "image"))
+                h["image"] = (
+                    node_id,
+                    "image" if "image" in inputs else next(iter(inputs), "image"),
+                )
             elif title.startswith(TITLE_LOCK):
                 pass  # just a lock marker, no flag
             elif title.startswith(TITLE_PREFIX):
@@ -531,10 +563,16 @@ class Pipe:
                 name = name.strip().lower()
                 wanted = wanted.strip()
                 field = None
-                if wanted and not isinstance(inputs.get(wanted), list) and wanted in inputs:
+                if (
+                    wanted
+                    and not isinstance(inputs.get(wanted), list)
+                    and wanted in inputs
+                ):
                     field = wanted
                 elif wanted:
-                    field = None  # field does not exist: marker is dropped, note in --help
+                    field = (
+                        None  # field does not exist: marker is dropped, note in --help
+                    )
                     h.setdefault("marker_errors", []).append(
                         f"Knoten {node_id}: Feld '{wanted}' existiert nicht "
                         f"(vorhanden: {', '.join(k for k, v in inputs.items() if not isinstance(v, list)) or 'keine'})"
@@ -648,7 +686,9 @@ class Pipe:
             pass
         try:
             if raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR":
-                return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+                return int.from_bytes(raw[16:20], "big"), int.from_bytes(
+                    raw[20:24], "big"
+                )
             if raw[:2] == b"\xff\xd8":
                 i = 2
                 while i + 9 < len(raw):
@@ -660,8 +700,21 @@ class Pipe:
                         i += 2
                         continue
                     length = int.from_bytes(raw[i + 2 : i + 4], "big")
-                    if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-                                  0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    if marker in (
+                        0xC0,
+                        0xC1,
+                        0xC2,
+                        0xC3,
+                        0xC5,
+                        0xC6,
+                        0xC7,
+                        0xC9,
+                        0xCA,
+                        0xCB,
+                        0xCD,
+                        0xCE,
+                        0xCF,
+                    ):
                         hh = int.from_bytes(raw[i + 5 : i + 7], "big")
                         w = int.from_bytes(raw[i + 7 : i + 9], "big")
                         return (w, hh) if w and hh else None
@@ -685,7 +738,9 @@ class Pipe:
             pass
         return None
 
-    def _nearest_ratio_option(self, options: list[str], width: int, height: int) -> Optional[str]:
+    def _nearest_ratio_option(
+        self, options: list[str], width: int, height: int
+    ) -> Optional[str]:
         """The ResolutionSelector entry whose ratio is closest to
         width:height (compared on a log scale, so 2:1 and 1:2 are equally
         far from 1:1)."""
@@ -721,7 +776,9 @@ class Pipe:
                 return current
         return raw
 
-    async def _translate(self, session, text: str) -> tuple[Optional[str], Optional[str]]:
+    async def _translate(
+        self, session, text: str
+    ) -> tuple[Optional[str], Optional[str]]:
         v = self.valves
         url = v.ollama_url.rstrip("/") + "/api/generate"
         base = {
@@ -878,16 +935,28 @@ class Pipe:
                 continue
         return found
 
-    def _system_prompt(self, body: dict) -> tuple[str, bool]:
+    def _system_prompt(self, body: dict) -> tuple[str, bool, bool]:
         """Fetch the workspace model's system prompt from the messages.
 
         Assumption (Open WebUI default behaviour): the system prompt stored
         in the model is passed as a message with role 'system' at the start
-        of the messages array. The first such message is used.
+        of the messages array. The first system message that still has
+        content after cleaning is used.
 
-        Returns: (system prompt without wrapper blocks, whether Open WebUI's
-        memory block was part of it).
+        Two things Open WebUI itself puts into the system message are
+        removed:
+        - the <memory_context> block of the memory feature (wrapper tag)
+        - the chat summary of Context Compaction, prefixed with
+          "[CONVERSATION SUMMARY]": everything from the marker to the end
+          of the message goes. It either REPLACES the model's system prompt
+          (nothing is left, the next system message is tried) or is APPENDED
+          to it (the real prompt before the marker survives).
+
+        Returns: (system prompt without those parts, whether the memory
+        block was present, whether a compaction summary was present).
         """
+        had_memory = False
+        had_summary = False
         for msg in body.get("messages") or []:
             if msg.get("role") != "system":
                 continue
@@ -897,17 +966,28 @@ class Pipe:
                     p.get("text", "") for p in content if p.get("type") == "text"
                 )
             content = str(content)
-            had_memory = "<memory_context" in content
-            return _strip_wrappers(content), had_memory
-        return "", False
+            if "<memory_context" in content:
+                had_memory = True
+            idx = content.lower().find(COMPACTION_MARKER.lower())
+            if idx >= 0:
+                had_summary = True
+                content = content[:idx]
+            cleaned = _strip_wrappers(content)
+            if cleaned:
+                return cleaned, had_memory, had_summary
+        return "", had_memory, had_summary
 
     async def _upload_image(self, session, base: str, raw: bytes, filename: str):
         """Upload an image to ComfyUI. Returns: (reference, error text)."""
         import io as _io
 
         data = aiohttp.FormData()
-        data.add_field("image", _io.BytesIO(raw), filename=filename,
-                       content_type="application/octet-stream")
+        data.add_field(
+            "image",
+            _io.BytesIO(raw),
+            filename=filename,
+            content_type="application/octet-stream",
+        )
         data.add_field("overwrite", "true")
         try:
             async with session.post(f"{base}/upload/image", data=data) as resp:
@@ -994,7 +1074,11 @@ class Pipe:
                 options = await self._resolution_options(session, base)
                 if options:
                     match = next(
-                        (o for o in options if o == wanted or o.split(" ")[0] == wanted),
+                        (
+                            o
+                            for o in options
+                            if o == wanted or o.split(" ")[0] == wanted
+                        ),
                         None,
                     )
                     if match:
@@ -1015,7 +1099,9 @@ class Pipe:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 return await self._normalize(session, base, wf, h, values)
         except Exception as e:
-            return dict(values), [f"ComfyUI nicht erreichbar ({e}) — ungeprüft gespeichert"]
+            return dict(values), [
+                f"ComfyUI nicht erreichbar ({e}) — ungeprüft gespeichert"
+            ]
 
     def _merge_lora_value(self, old: str, new: str) -> str:
         """Merge name and strength separately: whatever the new value does not
@@ -1050,7 +1136,9 @@ class Pipe:
     def _match_lora(self, fragment: str, options: list[str]):
         return self._match_option(fragment, options, "LoRA")
 
-    async def _field_options(self, session, base: str, class_type: str, field: str) -> list[str]:
+    async def _field_options(
+        self, session, base: str, class_type: str, field: str
+    ) -> list[str]:
         """Ask ComfyUI for the selectable values of an arbitrary node field."""
         try:
             async with session.get(f"{base}/object_info/{class_type}") as resp:
@@ -1077,7 +1165,9 @@ class Pipe:
         try:
             file_id = str(_uuid.uuid4())
             safe = filename or "comfyui.png"
-            _contents, path = Storage.upload_file(io.BytesIO(raw), f"{file_id}_{safe}", {})
+            _contents, path = Storage.upload_file(
+                io.BytesIO(raw), f"{file_id}_{safe}", {}
+            )
             await Files.insert_new_file(
                 user_id,
                 FileForm(
@@ -1175,8 +1265,21 @@ class Pipe:
         out: dict = {"loras": ("loras", None)}
         # Not via _known_flags, because that already contains the listing flags
         taken = {
-            "help", "no", "seed", "steps", "cfg", "guidance", "batch", "ar", "mp",
-            "translate", "triggers", "loras", "reset", "anleitung", "arauto",
+            "help",
+            "no",
+            "seed",
+            "steps",
+            "cfg",
+            "guidance",
+            "batch",
+            "ar",
+            "mp",
+            "translate",
+            "triggers",
+            "loras",
+            "reset",
+            "anleitung",
+            "arauto",
         }
         taken |= {f"lora{i}" for i in range(1, len(h["loras"]) + 1)}
         taken |= set(h["markers"])
@@ -1195,8 +1298,19 @@ class Pipe:
 
     def _known_flags(self, h: dict) -> set:
         known = {
-            "help", "no", "seed", "steps", "cfg", "guidance",
-            "batch", "ar", "mp", "translate", "triggers", "loras", "reset",
+            "help",
+            "no",
+            "seed",
+            "steps",
+            "cfg",
+            "guidance",
+            "batch",
+            "ar",
+            "mp",
+            "translate",
+            "triggers",
+            "loras",
+            "reset",
             "arauto",
         }
         known |= {f"lora{i}" for i in range(1, len(h["loras"]) + 1)}
@@ -1205,7 +1319,9 @@ class Pipe:
         known |= {"loras", "ars"}
         return known
 
-    async def _queue_position(self, session, base: str, prompt_id: str) -> Optional[int]:
+    async def _queue_position(
+        self, session, base: str, prompt_id: str
+    ) -> Optional[int]:
         """0/None = running or unknown, n > 0 = waiting at position n."""
         try:
             async with session.get(f"{base}/queue") as resp:
@@ -1394,6 +1510,9 @@ dahinter; bei Bearbeitungs-Workflows genügt dann das Bild allein.
 Kürzel im Systemprompt werden nicht ausgewertet, sondern landen
 wörtlich im Bild-Prompt. Chats ohne getippten Text bekommen
 automatisch einen Titel aus Zeitstempel und Modellname.
+Was Open WebUI selbst in die Systemnachricht schreibt (Gedächtnis-Block,
+Chat-Zusammenfassung der Context Compaction), wird vorher entfernt und
+in der Info-Zeile vermerkt.
 
 ## Stolperfallen
 
@@ -1403,12 +1522,22 @@ automatisch einen Titel aus Zeitstempel und Modellname.
 - Krea2-Bilder kaputt → cfg über 1 gedreht.
 - LoRA wirkt nicht → Architektur passt nicht zum Bildmodell."""
 
-    def _describe(self, name: str, h: dict, wf: dict, defaults: Optional[dict] = None,
-                  listers: Optional[dict] = None) -> str:
+    def _describe(
+        self,
+        name: str,
+        h: dict,
+        wf: dict,
+        defaults: Optional[dict] = None,
+        listers: Optional[dict] = None,
+    ) -> str:
         listers = listers or {}
         lines = [f"**{name}** - erkannte Stellhebel:", ""]
-        lines.append(f"- Prompt: {'Knoten ' + h['prompt'][0] if h.get('prompt') else 'NICHT GEFUNDEN (PIPE_PROMPT vergeben?)'}")
-        lines.append(f"- Negativ: {'Knoten ' + h['negative'][0] if h.get('negative') else 'keiner (--no wirkungslos)'}")
+        lines.append(
+            f"- Prompt: {'Knoten ' + h['prompt'][0] if h.get('prompt') else 'NICHT GEFUNDEN (PIPE_PROMPT vergeben?)'}"
+        )
+        lines.append(
+            f"- Negativ: {'Knoten ' + h['negative'][0] if h.get('negative') else 'keiner (--no wirkungslos)'}"
+        )
         for key, label in (
             ("seed", "Seed"),
             ("steps", "Schritte"),
@@ -1417,7 +1546,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
         ):
             lines.append(f"- {label}: {'Knoten ' + h[key][0] if h.get(key) else '-'}")
         if h.get("image"):
-            lines.append(f"- Bildeingang: Knoten {h['image'][0]} (Foto an die Nachricht anhängen)")
+            lines.append(
+                f"- Bildeingang: Knoten {h['image'][0]} (Foto an die Nachricht anhängen)"
+            )
             if self.valves.auto_ar_from_image:
                 lines.append(
                     "- `--arauto 1/0` : Seitenverhältnis automatisch aus dem angehängten Bild "
@@ -1431,7 +1562,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                     for nid in h["dimension_nodes"]
                 )
             )
-        lines.append(f"- Auflösung: {'ResolutionSelector ' + h['resolution'] if h.get('resolution') else ('Latent ' + h['latent'] if h.get('latent') else '-')}")
+        lines.append(
+            f"- Auflösung: {'ResolutionSelector ' + h['resolution'] if h.get('resolution') else ('Latent ' + h['latent'] if h.get('latent') else '-')}"
+        )
         for i, nid in enumerate(h["loras"], start=1):
             lname = wf[nid]["inputs"].get("lora_name", "?")
             strength = wf[nid]["inputs"].get("strength_model", "?")
@@ -1439,7 +1572,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
         for nid in h.get("locked_loras", []):
             lname = wf[nid]["inputs"].get("lora_name", "?")
             strength = wf[nid]["inputs"].get("strength_model", "?")
-            lines.append(f"- (fest) {lname}, Stärke {strength} — für diesen Workflow nicht änderbar")
+            lines.append(
+                f"- (fest) {lname}, Stärke {strength} — für diesen Workflow nicht änderbar"
+            )
         for name, (nid, field) in h["markers"].items():
             cur = wf[nid]["inputs"][field]
             if isinstance(cur, bool):
@@ -1450,7 +1585,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                 hinweis = " — Namensteil genügt"
             else:
                 hinweis = ""
-            lines.append(f"- `--{name}` : Knoten {nid}.{field} (aktuell {cur}){hinweis}")
+            lines.append(
+                f"- `--{name}` : Knoten {nid}.{field} (aktuell {cur}){hinweis}"
+            )
         if h.get("prompt_result"):
             lines.append(
                 f"- Ergebnis-Prompt: Knoten {h['prompt_result']} "
@@ -1458,8 +1595,11 @@ automatisch einen Titel aus Zeitstempel und Modellname.
             )
         lines.append(
             "- Bildausgabe: "
-            + (", ".join(f"Knoten {n}" for n in h["outputs"]) if h.get("outputs")
-               else "⚠ KEINE — Workflow erzeugt so kein Bild")
+            + (
+                ", ".join(f"Knoten {n}" for n in h["outputs"])
+                if h.get("outputs")
+                else "⚠ KEINE — Workflow erzeugt so kein Bild"
+            )
         )
         for nid in h.get("internal", []):
             ctype = h.get("internal_types", {}).get(nid, "?")
@@ -1496,8 +1636,7 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                 "",
                 "**Gespeicherte Vorgaben** (übersteuern die Datei-Werte oben, `--reset` löscht):",
             ] + [f"- `--{k} {v}`".rstrip() for k, v in defaults.items()]
-        lines += [
-        ]
+        lines += []
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -1631,7 +1770,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
             for k in resets:
                 accepted.pop(k)
                 if defaults.pop(k, None) is not None:
-                    notes.append(f"`--{k}` zurückgesetzt — es gilt wieder der Wert aus dem Workflow.")
+                    notes.append(
+                        f"`--{k}` zurückgesetzt — es gilt wieder der Wert aus dem Workflow."
+                    )
                 else:
                     notes.append(f"`--{k}` war nicht gesetzt — nichts zu ändern.")
 
@@ -1661,7 +1802,11 @@ automatisch einen Titel aus Zeitstempel und Modellname.
             if notes:
                 lines += [""] + notes
             if unknown:
-                lines += ["", "Unbekannt und nicht gespeichert: " + ", ".join("--" + u for u in unknown)]
+                lines += [
+                    "",
+                    "Unbekannt und nicht gespeichert: "
+                    + ", ".join("--" + u for u in unknown),
+                ]
             return "\n".join(lines)
 
         if not prompt and not has_image_input and not (set(flags) & command_flags):
@@ -1672,7 +1817,8 @@ automatisch einen Titel aus Zeitstempel und Modellname.
 
         msg_flags = dict(flags)
         bare = {
-            k for k, v in msg_flags.items()
+            k
+            for k, v in msg_flags.items()
             if not str(v).strip() and k not in command_flags
         }
         if defaults:
@@ -1698,9 +1844,7 @@ automatisch einen Titel aus Zeitstempel und Modellname.
         # their own prompt keep their usual title.
         if not prompt:
             meta = __metadata__ or {}
-            model_label = (
-                (meta.get("model") or {}).get("name") or name or pipe_id
-            )
+            model_label = (meta.get("model") or {}).get("name") or name or pipe_id
             title = time.strftime("%Y%m%d %H:%M") + f" {model_label}"
             outcome, detail = await self._set_chat_title(meta.get("chat_id"), title)
             if outcome == "gesetzt":
@@ -1713,9 +1857,13 @@ automatisch einen Titel aus Zeitstempel und Modellname.
         # --- Prepend the model's system prompt permanently ---
         # Deliberately only here: the branches above (help, saving defaults,
         # "Kein Prompt angegeben") still depend on the typed text alone.
-        system_prompt, had_memory = self._system_prompt(body)
+        system_prompt, had_memory, had_summary = self._system_prompt(body)
         if had_memory:
             used.append("Gedächtnis-Block aus dem Systemprompt entfernt")
+        if had_summary:
+            used.append(
+                "Chat-Zusammenfassung (Context Compaction) aus dem Systemprompt entfernt"
+            )
         if system_prompt:
             if prompt:
                 prompt = f"{system_prompt.rstrip(' ,.')}, {prompt}"
@@ -1743,7 +1891,11 @@ automatisch einen Titel aus Zeitstempel und Modellname.
             used.append(f"seed {seed}")
 
         # --- Steps ---
-        steps = int(flags["steps"]) if flags.get("steps", "").isdigit() else user_valves.steps
+        steps = (
+            int(flags["steps"])
+            if flags.get("steps", "").isdigit()
+            else user_valves.steps
+        )
         if steps > 0 and self._set(wf, h.get("steps"), steps):
             used.append(f"{steps} Schritte")
 
@@ -1772,7 +1924,11 @@ automatisch einen Titel aus Zeitstempel und Modellname.
             used.append(f"{marker_name}: {value}")
 
         # --- Batch ---
-        batch = int(flags["batch"]) if flags.get("batch", "").isdigit() else user_valves.batch_size
+        batch = (
+            int(flags["batch"])
+            if flags.get("batch", "").isdigit()
+            else user_valves.batch_size
+        )
         if batch > 0:
             if not h.get("latent"):
                 used.append(
@@ -1794,7 +1950,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
         # --- Report unknown flags instead of swallowing them silently ---
         unknown = [k for k in flags if k not in self._known_flags(h)]
         if unknown:
-            used.append("unbekannt und ignoriert: " + ", ".join("--" + u for u in unknown))
+            used.append(
+                "unbekannt und ignoriert: " + ", ".join("--" + u for u in unknown)
+            )
 
         try:
             timeout = aiohttp.ClientTimeout(total=self.valves.timeout_seconds)
@@ -1812,7 +1970,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                         titel = "Seitenverhältnisse"
                     else:
                         class_type, field, marker_name = payload
-                        options = await self._field_options(session, base, class_type, field)
+                        options = await self._field_options(
+                            session, base, class_type, field
+                        )
                         titel = f"Werte für `--{marker_name}`"
                     if not options:
                         return (
@@ -1832,14 +1992,15 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                         kopf = f"**{titel}** ({len(options)}):"
                     return kopf + "\n\n" + "\n".join(f"- `{o}`" for o in shown)
 
-
                 # --- Upload the attached image ---
                 images_in = self._extract_images(body)
                 if h.get("image"):
                     if images_in:
                         raw_img, fname = images_in[0]
                         await self._emit(__event_emitter__, "Bild wird hochgeladen ...")
-                        ref, err = await self._upload_image(session, base, raw_img, fname)
+                        ref, err = await self._upload_image(
+                            session, base, raw_img, fname
+                        )
                         if err:
                             return f"Das Bild konnte nicht an ComfyUI uebergeben werden: {err}"
                         self._set(wf, h["image"], ref)
@@ -1873,10 +2034,16 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                 if auto_ar and h.get("image") and images_in and "ar" not in flags:
                     size = self._image_size(images_in[0][0])
                     if not size:
-                        used.append("Format aus Bild: Bildgröße nicht lesbar, Vorgabe bleibt")
+                        used.append(
+                            "Format aus Bild: Bildgröße nicht lesbar, Vorgabe bleibt"
+                        )
                     elif h.get("resolution"):
                         options = await self._resolution_options(session, base)
-                        chosen = self._nearest_ratio_option(options, *size) if options else None
+                        chosen = (
+                            self._nearest_ratio_option(options, *size)
+                            if options
+                            else None
+                        )
                         if chosen:
                             flags["ar"] = chosen
                             ar_from_image = f"{size[0]}x{size[1]}"
@@ -1889,7 +2056,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                         flags["ar"] = f"{size[0]}:{size[1]}"
                         ar_from_image = f"{size[0]}x{size[1]}"
                     else:
-                        used.append("Format aus Bild: Workflow hat keine setzbare Größe")
+                        used.append(
+                            "Format aus Bild: Workflow hat keine setzbare Größe"
+                        )
 
                 # --- Validate all values together once ---
                 # The aspect ratio from the chat controls has to pass through
@@ -1930,7 +2099,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                     masked, kept = self._protect(prompt)
                     english, err = await self._translate(session, masked)
                     if err:
-                        used.append(f"Übersetzung fehlgeschlagen ({err}), Original verwendet")
+                        used.append(
+                            f"Übersetzung fehlgeschlagen ({err}), Original verwendet"
+                        )
                     elif english:
                         final_prompt = self._restore(english, kept)
                         if final_prompt.strip() == prompt.strip():
@@ -1944,14 +2115,18 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                         if neg_en and not neg_err:
                             self._set(wf, h["negative"], neg_en)
                 elif do_translate:
-                    used.append("Übersetzung angefordert, aber kein Modell in den Valves gesetzt")
+                    used.append(
+                        "Übersetzung angefordert, aber kein Modell in den Valves gesetzt"
+                    )
                 else:
                     used.append("ohne Übersetzung")
 
                 # --- Trigger words of the active LoRAs ---
                 triggers = self._triggers_for(wf, h)
                 if triggers:
-                    final_prompt = final_prompt.rstrip(" ,.") + ", " + ", ".join(triggers)
+                    final_prompt = (
+                        final_prompt.rstrip(" ,.") + ", " + ", ".join(triggers)
+                    )
                     used.append("Trigger: " + ", ".join(triggers))
 
                 self._set(wf, h["prompt"], final_prompt)
@@ -1992,7 +2167,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                             wf[nid]["inputs"]["width"] = w
                             wf[nid]["inputs"]["height"] = hh
                         extra = (
-                            f" (in {len(targets)} Knoten gesetzt)" if len(targets) > 1 else ""
+                            f" (in {len(targets)} Knoten gesetzt)"
+                            if len(targets) > 1
+                            else ""
                         )
                         if ar_from_image:
                             extra += f" (Format aus Bild {ar_from_image})"
@@ -2040,8 +2217,12 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                         if node_errors and attempt == 1:
                             problems = []
                             for nid, err in node_errors.items():
-                                title = (wf.get(nid, {}).get("_meta") or {}).get("title", "")
-                                label = f"{nid} ({wf.get(nid, {}).get('class_type', '?')}"
+                                title = (wf.get(nid, {}).get("_meta") or {}).get(
+                                    "title", ""
+                                )
+                                label = (
+                                    f"{nid} ({wf.get(nid, {}).get('class_type', '?')}"
+                                )
                                 label += f", {title})" if title else ")"
                                 for detail in err.get("errors") or []:
                                     problems.append(
@@ -2060,16 +2241,18 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                             elapsed = time.monotonic() - started
                             if elapsed > self.valves.timeout_seconds:
                                 break
-                            async with session.get(f"{base}/history/{prompt_id}") as resp:
+                            async with session.get(
+                                f"{base}/history/{prompt_id}"
+                            ) as resp:
                                 data = await resp.json()
                             if prompt_id in data:
                                 history = data[prompt_id]
                                 break
-                            position = await self._queue_position(session, base, prompt_id)
+                            position = await self._queue_position(
+                                session, base, prompt_id
+                            )
                             if position:
-                                text = (
-                                    f"{name}: wartet, Position {position} in der Warteschlange"
-                                )
+                                text = f"{name}: wartet, Position {position} in der Warteschlange"
                             else:
                                 suffix = " (2. Versuch)" if attempt > 1 else ""
                                 text = f"{name}: rechnet{suffix} ... ({int(elapsed)} s)"
@@ -2085,9 +2268,7 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                         raise
 
                     if history is None:
-                        return (
-                            "Zeitüberschreitung: ComfyUI hat den Auftrag nicht abgeschlossen."
-                        )
+                        return "Zeitüberschreitung: ComfyUI hat den Auftrag nicht abgeschlossen."
 
                     status = history.get("status", {})
                     if status.get("status_str") != "error":
@@ -2169,14 +2350,18 @@ automatisch einen Titel aus Zeitstempel und Modellname.
 
                     url = None
                     if self.valves.store_images_as_files:
-                        url, err = await self._store_image(data, img["filename"], user_id)
+                        url, err = await self._store_image(
+                            data, img["filename"], user_id
+                        )
                         if err and not store_error:
                             store_error = err
                     if url:
                         blocks.append(f"![{img['filename']}]({url})")
                     else:
                         b64 = base64.b64encode(data).decode()
-                        blocks.append(f"![{img['filename']}](data:image/png;base64,{b64})")
+                        blocks.append(
+                            f"![{img['filename']}](data:image/png;base64,{b64})"
+                        )
 
                 if store_error:
                     used.append(f"Dateiablage übersprungen ({store_error})")
@@ -2189,7 +2374,9 @@ automatisch einen Titel aus Zeitstempel und Modellname.
                     parts = []
                     for k, v in defaults.items():
                         if k in msg_flags and str(msg_flags[k]) != str(v):
-                            parts.append(f"--{k} {msg_flags[k]} (Vorgabe {v} übersteuert)".rstrip())
+                            parts.append(
+                                f"--{k} {msg_flags[k]} (Vorgabe {v} übersteuert)".rstrip()
+                            )
                         else:
                             parts.append(f"--{k} {v}".rstrip())
                     used.append("Vorgaben: " + ", ".join(parts))
