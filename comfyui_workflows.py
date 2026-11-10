@@ -1,9 +1,9 @@
 """
 title: OI-ComfyUI-Workflows
 author: Wolfgang Weber (WolfgangW77 on github)
-version: 0.13.3
+version: 0.14.0
 license: MIT
-description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
+description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), image series from an LLM-written prompt list (--serie, --los), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
 requirements: aiohttp
 
 Written with AI assistance (Claude by Anthropic); reviewed and maintained
@@ -291,10 +291,65 @@ v0.13.3
   admin manual ("Alle laufen pipe-lokal" - there are five clean-up
   commands now; the run-time note names Alpaka's file-head constants
   explicitly), dead statement removed from the --help builder.
+
+v0.14.0
+- Image series. "brief --serie N" lets an Ollama model (admin valve
+  series_model) write N English image prompts as a numbered list in the
+  chat; "--los" renders the latest list, "--los 1,3,7" a selection,
+  "--serie N --nowait" renders right away. The list can be edited with
+  Open WebUI's edit function before "--los" - the visible text is read
+  back from the chat history (header "**Prompt-Serie**", one line per
+  prompt, "N. [ratio] text"). N defaults to 10, capped by series_max
+  (default 20, counts prompts, not images).
+- Prompt list request: /api/generate via ollama_url WITHOUT a GPU slot
+  (a normal Alpaka request), streamed, with a JSON schema in "format";
+  the status line counts words while it arrives ("~3.200 Wörter") or
+  shows "denkt nach". Same fallback chain as the translation (think
+  off, no think field, instruction inside the prompt). No read timeout
+  (the request may wait in Alpaka's queue); done_reason "length" or
+  cut-off JSON gives a clear "Antwort abgeschnitten" message. New admin
+  valves series_model, series_keep_alive (default "0"), series_num_ctx
+  (0 = Ollama/model setting), series_system (instruction text, without
+  a fixed word range), series_max, series_ar_options.
+- Prompt length: user valve series_words (default 60, 0 = no target,
+  max 500) and flag --words N (message > saved default > user valve);
+  the list header shows target and achieved average.
+- Format of a series: --ar (message or saved default) > input image >
+  aspect_ratio user valve > the LLM per prompt (enum of the workflow's
+  ResolutionSelector entries, or series_ar_options for plain width/height
+  workflows) > workflow file. A fixed format is named once in the header
+  ("Format: 16:9, fixiert über User-Valve") and the LLM is not asked.
+- All other flags are taken 1:1 from the user for every image; flags on
+  the --los message override those of the --serie message, which
+  override saved defaults. An image attached to --los replaces the one
+  of the --serie message (Open WebUI resends older images as base64). A
+  fixed seed applies to every image, otherwise each gets a new one;
+  --batch applies per prompt; translation is off in series mode; the
+  model's system prompt goes to the prompt LLM as fixed requirements.
+- Rendering: one GPU slot for the whole series (label "<workflow>
+  (Serie N)"). _run returns an async generator for --los/--nowait, which
+  Open WebUI streams, so every image appears as soon as it is done. The
+  generator owns slot release and the closing status line, since
+  pipe()'s finally block runs before it starts. A failed image (ComfyUI
+  error, compute cap, no image, rejection) is reported and the series
+  continues; 3 failures in a row or ComfyUI unreachable end it; the stop
+  button ends it with the running job withdrawn. Finished images stay.
+- Refactoring: the render core (submit, wait, retry, withdraw on compute
+  cap or connection loss, fetch, store) moved from _run into
+  _render_job, which returns a result instead of a finished message;
+  preparation (_apply_static, _prepare_in_session), resolution
+  (_apply_resolution) and trigger words (_active_triggers) are shared
+  helpers. The single-image path produces the same output as before.
+- --help and --anleitung describe the series; serie, nowait, los and
+  words are reserved flag names (no colliding marker lister).
+- Fix (--help, admin part): --handover-comfy 0/1 and --handover-ollama
+  0/1 are now in backticks like every other command, so they can be
+  copied with a click.
 """
 
 import asyncio
 import base64
+import copy
 import inspect
 import json
 import math
@@ -326,6 +381,29 @@ DEFAULT_TRANSLATE_SYSTEM = (
     "nothing, remove nothing, explain nothing, do not comment. Leave any marker of the "
     "form <<0>>, <<1>> exactly as it is. Output only the English text, on one line."
 )
+
+# --- Image series (v0.14.0) ---
+DEFAULT_SERIES_SYSTEM = (
+    "You write prompts for the text-to-image model Krea 2. You receive a brief, a "
+    "number N and optionally a target length, fixed requirements and a list of allowed "
+    "aspect ratios. Write exactly N clearly different prompts that all fulfil the brief "
+    "and vary it in subject detail, setting, composition, lighting and mood. Write "
+    "every prompt in English as natural descriptive language: start with the overall "
+    "style or medium (e.g. photo, oil painting), then the main subject, setting, "
+    "composition and camera, lighting and mood. No keyword lists, no weights, no "
+    "quality tags, no negative prompts. Never add trigger words, LoRA names or anything "
+    "starting with --. If a target length is given, keep every prompt close to it. If "
+    "fixed requirements are given, honour them in every prompt. If allowed aspect ratios "
+    "are given, pick for every prompt the one that fits its composition best. Reply "
+    "only with the JSON object."
+)
+SERIES_FLAGS = {"serie", "nowait", "los"}  # commands, never stored as defaults
+SERIES_DEFAULT_COUNT = 10  # --serie without a number
+SERIES_WORDS_MAX = 500  # upper bound for --words / series_words
+SERIES_FAIL_STREAK = 3  # failed images in a row that end a series
+LIST_HEADER = "**Prompt-Serie**"  # first line of a prompt list in the chat
+# One list entry: "3. [16:9] text" or "3. text" (also "3)")
+LIST_LINE_RE = re.compile(r"^\s*(\d+)[.)]\s+(?:\[([^\]]*)\]\s*)?(.*\S)\s*$")
 
 # Nodes recognised by their class_type: class_type -> input field
 SEED_FIELDS = {
@@ -399,7 +477,10 @@ COMMAND_FLAGS = {
     "handover",
     "handover-comfy",
     "handover-ollama",
-}  # admin clean-up + handover
+    "serie",
+    "nowait",
+    "los",
+}  # admin clean-up + handover + image series (v0.14.0)
 
 # Chat titles that count as "no title yet" (compared in lower case)
 EMPTY_TITLES = {"", "new chat", "neuer chat"}
@@ -534,9 +615,9 @@ class Pipe:
         ollama_url: str = Field(
             default="http://host.docker.internal:11435",
             description=(
-                "Basis-URL für die Prompt-Übersetzung: mit Alpaka die "
-                "Proxy-URL (Standard, Port 11435), ohne Alpaka Ollama direkt "
-                "(üblicherweise Port 11434)."
+                "Basis-URL für die Prompt-Übersetzung und die Prompt-Liste der "
+                "Bildserien: mit Alpaka die Proxy-URL (Standard, Port 11435), "
+                "ohne Alpaka Ollama direkt (üblicherweise Port 11434)."
             ),
         )
         proxy_url: str = Field(
@@ -584,6 +665,49 @@ class Pipe:
                 "für alle Benutzer abgeschaltet."
             ),
         )
+        # --- Image series (v0.14.0) ---
+        series_model: str = Field(
+            default="",
+            description=(
+                "Ollama-Modell, das bei --serie die Prompt-Liste schreibt. "
+                "Leer = Serienmodus nicht verfügbar."
+            ),
+        )
+        series_keep_alive: str = Field(
+            default="0",
+            description=(
+                "Wie lange das Prompt-Modell nach der Liste im VRAM bleibt. "
+                "'0' = sofort entladen (danach folgt ohnehin GPU-Arbeit)."
+            ),
+        )
+        series_num_ctx: int = Field(
+            default=0,
+            description=(
+                "Kontextgröße (num_ctx) der Prompt-Anfrage. 0 = Einstellung von "
+                "Ollama bzw. des Modells."
+            ),
+        )
+        series_system: str = Field(
+            default=DEFAULT_SERIES_SYSTEM,
+            description=(
+                "Anweisung an das Prompt-Modell. Anzahl, Länge, feste Vorgaben und "
+                "erlaubte Formate hängt die Pipe selbst an."
+            ),
+        )
+        series_max: int = Field(
+            default=20,
+            description=(
+                "Obergrenze für --serie N. Zählt Prompts, nicht Bilder "
+                "(--batch gilt je Prompt)."
+            ),
+        )
+        series_ar_options: str = Field(
+            default="1:1, 4:3, 3:4, 3:2, 2:3, 16:9, 9:16",
+            description=(
+                "Formate, aus denen das Prompt-Modell bei Workflows ohne "
+                "ResolutionSelector (nur Breite/Höhe) wählt; kommagetrennt."
+            ),
+        )
 
     class UserValves(BaseModel):
         aspect_ratio: str = Field(
@@ -613,6 +737,13 @@ class Pipe:
             description=(
                 "Seitenverhältnis aus dem angehängten Bild übernehmen, wenn kein --ar "
                 "angegeben ist (nur Workflows mit Bildeingang)."
+            ),
+        )
+        series_words: int = Field(
+            default=60,
+            description=(
+                "Bildserien: ungefähre Länge je Prompt in englischen Wörtern. "
+                "0 = keine Vorgabe, höchstens 500. Einmalig per --words."
             ),
         )
 
@@ -1053,12 +1184,19 @@ class Pipe:
 
     def _extract_images(self, body: dict) -> list:
         """Collect attached images as (bytes, file name) from the last message."""
-        import base64 as _b64
-
         messages = body.get("messages") or []
         if not messages:
             return []
-        content = messages[-1].get("content", "")
+        return self._images_from_message(messages[-1])
+
+    def _images_from_message(self, message: dict) -> list:
+        """Collect attached images as (bytes, file name) from one message.
+        v0.14.0: split out of _extract_images so that --los can take the
+        image of the earlier --serie message (Open WebUI resends images of
+        older user messages as base64 data URLs)."""
+        import base64 as _b64
+
+        content = (message or {}).get("content", "")
         found = []
         raw_urls = []
         if isinstance(content, list):
@@ -1071,7 +1209,7 @@ class Pipe:
                     if url:
                         raw_urls.append(url)
         # Ollama style: list of base64 strings next to the text
-        for entry in messages[-1].get("images") or []:
+        for entry in (message or {}).get("images") or []:
             if isinstance(entry, str):
                 raw_urls.append(entry)
 
@@ -1440,6 +1578,12 @@ class Pipe:
             "reset",
             "anleitung",
             "arauto",
+            # v0.14.0: image series - reserved, so that e.g. a PIPE_WORD
+            # marker does not produce a colliding --words lister
+            "serie",
+            "nowait",
+            "los",
+            "words",
         }
         taken |= {f"lora{i}" for i in range(1, len(h["loras"]) + 1)}
         taken |= set(h["markers"])
@@ -1478,6 +1622,10 @@ class Pipe:
             "handover",  # v0.13.2: clean handover
             "handover-comfy",  # v0.13.2: clean handover
             "handover-ollama",  # v0.13.2: clean handover
+            "serie",  # v0.14.0: image series
+            "nowait",  # v0.14.0: image series
+            "los",  # v0.14.0: image series
+            "words",  # v0.14.0: image series (prompt length)
         }
         known |= {f"lora{i}" for i in range(1, len(h["loras"]) + 1)}
         known |= set(h["markers"])
@@ -1544,11 +1692,16 @@ class Pipe:
                 return entry.get("position")
         return None
 
-    async def _acquire_slot(self, emitter, name: str, tag: str):
+    async def _acquire_slot(
+        self, emitter, name: str, tag: str, status_label: Optional[str] = None
+    ):
         """Blocking acquire with position display. Returns (slot_id, err).
         A user abort cancels the request - Alpaka's socket peek then
         removes the waiting entry by itself. Waiting is deliberately NOT
-        bounded by timeout_seconds (slot specification)."""
+        bounded by timeout_seconds (slot specification).
+        name is the slot label at Alpaka; status_label (v0.14.0) replaces it
+        in the status line, e.g. "Serie" for a series slot."""
+        shown = status_label or name
         timeout = aiohttp.ClientTimeout(total=None)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -1567,12 +1720,12 @@ class Pipe:
                         if pos:
                             await self._emit(
                                 emitter,
-                                f"{name}: wartet auf freie GPU — "
+                                f"{shown}: wartet auf freie GPU — "
                                 f"Position {pos} in der Warteschlange ...",
                             )
                         else:
                             await self._emit(
-                                emitter, f"{name}: wartet auf freie GPU ..."
+                                emitter, f"{shown}: wartet auf freie GPU ..."
                             )
                     resp = post.result()
                 except asyncio.CancelledError:
@@ -1767,12 +1920,44 @@ Vorgaben des Workflows.
 
 **Rangfolge:** Nachricht > Vorgaben > Chat-Steuerung > Workflow-Datei.
 
+## Bildserien
+
+Ein Sprachmodell schreibt aus einer Vorgabe mehrere englische
+Bildprompts, danach werden sie nacheinander gerendert.
+
+1. `Katze in vier Jahreszeiten, Fotostil --serie 10` -- erzeugt 10
+   Prompts und zeigt sie als nummerierte Liste (ohne Zahl: 10).
+2. Liste prüfen, bei Bedarf über die Bearbeiten-Funktion der Antwort
+   ändern -- es gilt der bearbeitete Stand. Eine Zeile je Prompt.
+3. `--los` rendert alle, `--los 1,3,7` nur die genannten Nummern.
+
+| Kürzel | Wirkung |
+|---|---|
+| `--serie 5 --nowait` | Liste erzeugen und sofort rendern |
+| `--words 200` | ungefähre Länge je Prompt in englischen Wörtern (0 = keine Vorgabe, höchstens 500) |
+
+- **Format:** `--ar` gilt für alle Bilder. Ohne `--ar` gilt das Format
+  des angehängten Bildes, dann `aspect_ratio` aus der Chat-Steuerung --
+  sonst wählt das Sprachmodell je Prompt eins (steht in der Liste in
+  eckigen Klammern und lässt sich dort ändern).
+- **Alle anderen Kürzel** (`--lora1`, `--seed`, `--batch` ...) gelten
+  unverändert für jedes Bild. Kürzel an `--los` übersteuern die an
+  `--serie`. Ein Bild an `--los` ersetzt das Bild der `--serie`-Nachricht.
+- **Seed:** ein fester Seed gilt für alle Bilder der Serie, sonst bekommt
+  jedes Bild einen neuen.
+- **Übersetzung** entfällt -- das Sprachmodell schreibt gleich englisch.
+- Schlägt ein Bild fehl, geht es mit dem nächsten weiter; nach drei
+  Fehlschlägen in Folge bricht die Serie ab. Der Stopp-Knopf beendet die
+  Serie, fertige Bilder bleiben stehen.
+- Die Grafikkarte bleibt für die ganze Serie belegt -- Chats warten so
+  lange. Während die Liste nur angezeigt wird, ist nichts belegt.
+
 ## Chat-Steuerung (Schieberegler-Symbol)
 
 `translate` (Übersetzung dauerhaft an), `show_prompt` (Info-Zeile
 unter dem Bild -- anfangs anschalten!), `auto_ar` (Format aus dem
 angehängten Bild), `seed`, `steps`, `aspect_ratio`, `megapixels`,
-`batch_size`.
+`batch_size`, `series_words` (Promptlänge bei Bildserien).
 
 ## Gut zu wissen
 
@@ -1835,6 +2020,17 @@ Bildauftrag; aus = Verhalten wie v0.12.4). Das automatische
 VRAM-Freiräumen wohnt seit v0.13.2 im Alpaka-Proxy (Saubere Übergabe) —
 zur Laufzeit schaltbar per `--handover`; Alpakas Dateikopf-Konstanten
 sind nur die Erststart-Vorgaben.
+
+Bildserien: `series_model` (Ollama-Modell für die Prompt-Liste; leer =
+Serienmodus aus), `series_keep_alive` (Standard `0`), `series_num_ctx`
+(0 = Einstellung von Ollama bzw. des Modells), `series_system`
+(Anweisung ans Prompt-Modell; Anzahl, Länge, feste Vorgaben und Formate
+hängt die Pipe selbst an), `series_max` (Obergrenze für `--serie N`,
+zählt Prompts), `series_ar_options` (Formatauswahl für Workflows ohne
+ResolutionSelector). Die Prompt-Anfrage läuft ohne GPU-Slot als normale
+Anfrage über `ollama_url`; der Slot wird erst zum Rendern gezogen und
+dann für die ganze Serie gehalten. Ein Systemprompt am Workspace-Modell
+geht bei Serien als feste Vorgabe an das Prompt-Modell.
 
 ## Aufräum-Kommandos (nur Admins)
 
@@ -1984,9 +2180,18 @@ in der Info-Zeile vermerkt.
             "**Zurücksetzen:** Kürzel ohne Wert (z. B. `--vae`) verwirft die gespeicherte "
             "Vorgabe und stellt den Wert aus dem Workflow wieder her. `--reset` verwirft alle.",
             "",
+            "**Bildserien:** `Vorgabe --serie 10` lässt ein Sprachmodell eine Prompt-Liste "
+            "schreiben (Länge je Prompt: `--words 200`), `--los` rendert sie, `--los 1,3,7` "
+            "nur die genannten Nummern, `--serie 5 --nowait` sofort. "
+            + (
+                f"Prompt-Modell: {self.valves.series_model.strip()}."
+                if self.valves.series_model.strip()
+                else "⚠ Derzeit nicht verfügbar — Admin-Valve `series_model` ist leer."
+            ),
+            "",
             "**Zum Kopieren:** "
             + " ".join(f"`--{l}`" for l in sorted(listers))
-            + "  `--anleitung`  `--reset`",
+            + "  `--serie`  `--los`  `--anleitung`  `--reset`",
         ]
         if defaults:
             lines += [
@@ -2001,7 +2206,7 @@ in der Info-Zeile vermerkt.
                 "`--unload-ollama [name]` entlädt Ollama-Modelle (ohne Name: alle), "
                 "`--unload-comfy` gibt ComfyUIs Speicher frei, `--handover` "
                 "zeigt/schaltet Alpakas Saubere Übergabe (on/off/custom, "
-                "Einzelschalter --handover-comfy/--handover-ollama 0/1). "
+                "Einzelschalter `--handover-comfy 0/1` und `--handover-ollama 0/1`). "
                 "Alle laufen pipe-lokal — kein GPU-Slot, keine Übersetzung.",
             ]
         return "\n".join(lines)
@@ -2029,17 +2234,23 @@ in der Info-Zeile vermerkt.
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
         __task__: Optional[str] = None,
         __metadata__: Optional[dict] = None,
-    ) -> str:
+    ):
         """Wrapper around _run: makes sure the status display is cleared on
-        every path - including early returns and errors."""
+        every path - including early returns and errors.
+
+        v0.14.0: for --los and --serie --nowait, _run returns an async
+        generator that Open WebUI streams piece by piece. This finally block
+        runs before the generator produces anything, so the generator owns
+        its GPU slot and its closing status line itself."""
         started = time.monotonic()
         cancelled = False
         abort_note = None
+        result = None
         # v0.13.0: slot bookkeeping lives here so that EVERY end path of
         # _run (return, error, stop button) releases the GPU slot.
         slot_ctx = {"slot_id": None, "hb_task": None, "state": {"lost": False}}
         try:
-            return await self._run(
+            result = await self._run(
                 body,
                 __user__,
                 __event_emitter__,
@@ -2047,9 +2258,10 @@ in der Info-Zeile vermerkt.
                 __metadata__,
                 slot_ctx,
             )
+            return result
         except asyncio.CancelledError as e:
             # Stop button in Open WebUI. What _run cleaned up at ComfyUI is
-            # attached to the exception as an attribute (see polling loop).
+            # attached to the exception as an attribute (see _render_job).
             cancelled = True
             abort_note = getattr(e, "comfy_note", None)
             raise
@@ -2059,19 +2271,22 @@ in der Info-Zeile vermerkt.
             if slot_ctx["slot_id"]:
                 # shield: the release must go through even on a second stop
                 await asyncio.shield(self._release_slot(slot_ctx["slot_id"]))
-            elapsed = time.monotonic() - started
-            if cancelled:
-                text = "Abgebrochen"
-                if abort_note:
-                    text += f" — {abort_note}"
-                await self._emit(__event_emitter__, text, done=True)
-            elif elapsed < 1.5:
-                # Pure text output (--help, --loras) needs no duration
-                await self._emit(__event_emitter__, "", done=True)
+            if inspect.isasyncgen(result):
+                pass  # v0.14.0: the series generator reports its own status
             else:
-                await self._emit(
-                    __event_emitter__, f"Fertig in {_duration(elapsed)}", done=True
-                )
+                elapsed = time.monotonic() - started
+                if cancelled:
+                    text = "Abgebrochen"
+                    if abort_note:
+                        text += f" — {abort_note}"
+                    await self._emit(__event_emitter__, text, done=True)
+                elif elapsed < 1.5:
+                    # Pure text output (--help, --loras) needs no duration
+                    await self._emit(__event_emitter__, "", done=True)
+                else:
+                    await self._emit(
+                        __event_emitter__, f"Fertig in {_duration(elapsed)}", done=True
+                    )
 
     async def _run(
         self,
@@ -2081,7 +2296,7 @@ in der Info-Zeile vermerkt.
         __task__: Optional[str] = None,
         __metadata__: Optional[dict] = None,
         _slot_ctx: Optional[dict] = None,
-    ) -> str:
+    ):
         if __task__:
             return "ComfyUI"
         _slot_ctx = (
@@ -2093,15 +2308,7 @@ in der Info-Zeile vermerkt.
         pipe_id = str(body.get("model", "")).split(".")[-1]
 
         messages = body.get("messages") or []
-        raw = ""
-        if messages:
-            content = messages[-1].get("content", "")
-            if isinstance(content, list):
-                raw = "\n".join(
-                    p.get("text", "") for p in content if p.get("type") == "text"
-                )
-            else:
-                raw = str(content)
+        raw = self._message_text(messages[-1]) if messages else ""
 
         user_valves = (__user__ or {}).get("valves") or self.UserValves()
 
@@ -2260,6 +2467,23 @@ in der Info-Zeile vermerkt.
                         out.append(txt)
             return "\n\n".join(out)
 
+        # --- Image series (v0.14.0) ---
+        # Before help, saved defaults and the empty-prompt check: a bare
+        # "--los" would otherwise be treated as a defaults message.
+        if set(flags) & SERIES_FLAGS:
+            return await self._series_entry(
+                body,
+                __user__,
+                __event_emitter__,
+                __metadata__,
+                pipe_id,
+                wf,
+                name,
+                h,
+                prompt,
+                flags,
+            )
+
         has_image_input = bool(h.get("image")) and bool(self._extract_images(body))
         if "help" in flags or (not raw.strip() and not has_image_input):
             help_defaults = self._load_defaults((__user__ or {}).get("id"), pipe_id)
@@ -2269,11 +2493,7 @@ in der Info-Zeile vermerkt.
             )
 
         if not h.get("prompt"):
-            return (
-                f"Im Workflow **{name}** ist kein Knoten mit dem Titel `{TITLE_PROMPT}` markiert "
-                "und es ließ sich auch keiner herleiten. Bitte in ComfyUI den Knoten umbenennen, "
-                "der den Prompt-Text aufnimmt, und neu als API exportieren."
-            )
+            return self._no_prompt_node_text(name)
         user_id = (__user__ or {}).get("id")
         defaults = self._load_defaults(user_id, pipe_id)
 
@@ -2399,12 +2619,7 @@ in der Info-Zeile vermerkt.
 
         # --- Prompt and negative ---
         self._set(wf, h["prompt"], prompt)
-        if "no" in flags:
-            if h.get("negative"):
-                self._set(wf, h["negative"], flags["no"])
-                used.append(f"negativ: {flags['no']}")
-            else:
-                used.append("negativ: ignoriert (Workflow hat keinen Negativ-Zweig)")
+        self._apply_negative(wf, h, flags, used)
 
         # --- Seed ---
         seed = user_valves.seed
@@ -2415,6 +2630,256 @@ in der Info-Zeile vermerkt.
         if self._set(wf, h.get("seed"), seed):
             used.append(f"seed {seed}")
 
+        # --- Steps, cfg/guidance, marker nodes, batch (v0.14.0: shared) ---
+        file_markers = self._apply_static(wf, h, flags, user_valves, used)
+
+        # v0.14.0: --words only steers the prompt list of a series
+        if "words" in msg_flags:
+            used.append("--words wirkt nur zusammen mit --serie")
+
+        # --- Report unknown flags instead of swallowing them silently ---
+        unknown = [k for k in flags if k not in self._known_flags(h)]
+        if unknown:
+            used.append(
+                "unbekannt und ignoriert: " + ", ".join("--" + u for u in unknown)
+            )
+
+        try:
+            # v0.13.1: transport timeouts only — they detect a dead
+            # socket, they do not give up on a long render. The compute
+            # cap lives in the history loop (timeout_seconds, 0 = off).
+            timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+
+                for lister, (kind, payload) in listers.items():
+                    if lister not in flags:
+                        continue
+                    needle = str(flags[lister]).strip()
+                    if kind == "loras":
+                        options = await self._lora_options(session, base)
+                        titel = "Verfügbare LoRAs"
+                    elif kind == "resolution":
+                        options = await self._resolution_options(session, base)
+                        titel = "Seitenverhältnisse"
+                    else:
+                        class_type, field, marker_name = payload
+                        options = await self._field_options(
+                            session, base, class_type, field
+                        )
+                        titel = f"Werte für `--{marker_name}`"
+                    if not options:
+                        return (
+                            f"Für `--{lister}` liefert ComfyUI keine Auswahlliste. "
+                            "Entweder hat das Feld keine, oder ComfyUI antwortet nicht."
+                        )
+                    if needle:
+                        shown = [o for o in options if needle.lower() in o.lower()]
+                        if not shown:
+                            return (
+                                f"Keiner der {len(options)} Einträge enthält '{needle}'. "
+                                f"Ohne Filter listet `--{lister}` alle auf."
+                            )
+                        kopf = f"**{titel}** mit '{needle}' ({len(shown)} von {len(options)}):"
+                    else:
+                        shown = options
+                        kopf = f"**{titel}** ({len(options)}):"
+                    return kopf + "\n\n" + "\n".join(f"- `{o}`" for o in shown)
+
+                # --- Image upload, format from image, validation, LoRAs,
+                # file markers (v0.14.0: shared with the series path) ---
+                images_in = self._extract_images(body)
+                flags, ar_from_image, prep_err = await self._prepare_in_session(
+                    session,
+                    base,
+                    wf,
+                    h,
+                    flags,
+                    user_valves,
+                    images_in,
+                    used,
+                    file_markers,
+                    name,
+                    __event_emitter__,
+                    handle_ar=True,
+                )
+                if prep_err:
+                    return prep_err
+
+                # --- GPU slot at Alpaka (v0.13.0) ---
+                # Deliberately only here: uploads and option queries above
+                # need no GPU. From this point on (translation -> ComfyUI
+                # job -> rendering) the slot is held; pipe() releases it in
+                # every end path.
+                if self.valves.use_alpaka_proxy:
+                    slot_tag = str(
+                        (__metadata__ or {}).get("chat_id")
+                        or f"comfy-{random.randint(10000, 99999)}"
+                    )
+                    slot_id, slot_err = await self._acquire_slot(
+                        __event_emitter__, name, slot_tag
+                    )
+                    if slot_err:
+                        return self._slot_error_text(slot_err)
+                    _slot_ctx["slot_id"] = slot_id
+                    _slot_ctx["hb_task"] = asyncio.create_task(
+                        self._heartbeat_loop(slot_id, _slot_ctx["state"])
+                    )
+
+                # --- Translation ---
+                final_prompt = prompt
+                do_translate = user_valves.translate
+                if "translate" in flags:
+                    do_translate = self._coerce(flags["translate"], True)
+                if do_translate and self.valves.translate_model:
+                    await self._emit(__event_emitter__, "Prompt wird übersetzt ...")
+                    masked, kept = self._protect(prompt)
+                    english, err = await self._translate(
+                        session, masked, _slot_ctx["slot_id"]
+                    )
+                    if err:
+                        used.append(
+                            f"Übersetzung fehlgeschlagen ({err}), Original verwendet"
+                        )
+                    elif english:
+                        final_prompt = self._restore(english, kept)
+                        if final_prompt.strip() == prompt.strip():
+                            used.append(
+                                f"{self.valves.translate_model} hat den Text unverändert zurückgegeben"
+                            )
+                        else:
+                            used.append(f"übersetzt mit {self.valves.translate_model}")
+                    if h.get("negative") and flags.get("no"):
+                        neg_en, neg_err = await self._translate(
+                            session, flags["no"], _slot_ctx["slot_id"]
+                        )
+                        if neg_en and not neg_err:
+                            self._set(wf, h["negative"], neg_en)
+                elif do_translate:
+                    used.append(
+                        "Übersetzung angefordert, aber kein Modell in den Valves gesetzt"
+                    )
+                else:
+                    used.append("ohne Übersetzung")
+
+                # --- Trigger words of the active LoRAs ---
+                # v0.13.3: --triggers 0 (message or saved default) switches
+                # them off; default on, as documented in the manual.
+                triggers = self._active_triggers(wf, h, flags, used)
+                if triggers:
+                    final_prompt = (
+                        final_prompt.rstrip(" ,.") + ", " + ", ".join(triggers)
+                    )
+
+                self._set(wf, h["prompt"], final_prompt)
+                used.append(f"Prompt: {final_prompt}")
+
+                # --- Resolution ---
+                self._apply_resolution(
+                    wf,
+                    h,
+                    flags.get("ar", ""),
+                    self._megapixels(flags, user_valves),
+                    ar_from_image,
+                    used,
+                )
+
+                if not h.get("outputs"):
+                    return self._no_output_text(name)
+
+                # --- Submit, wait, fetch (v0.14.0: shared core) ---
+                res = await self._render_job(
+                    session, base, wf, h, f"{name}:", __event_emitter__, user_id
+                )
+                used.extend(res["notes"])
+                if res["kind"] != "ok":
+                    return res["text"]
+
+                if _slot_ctx["state"].get("lost"):
+                    used.append(
+                        "Hinweis: die GPU-Slot-Lease war zwischenzeitlich verfallen "
+                        "(Alpaka neu gestartet?) — der Auftrag lief trotzdem weiter"
+                    )
+
+                await self._emit(__event_emitter__, "Fertig", done=True)
+                out = "\n\n".join(res["blocks"])
+                if res["refined"]:
+                    out += f"\n\n---\n\n**Verwendeter Prompt:**\n\n{res['refined']}"
+                if defaults and user_valves.show_prompt:
+                    parts = []
+                    for k, v in defaults.items():
+                        if k in msg_flags and str(msg_flags[k]) != str(v):
+                            parts.append(
+                                f"--{k} {msg_flags[k]} (Vorgabe {v} übersteuert)".rstrip()
+                            )
+                        else:
+                            parts.append(f"--{k} {v}".rstrip())
+                    used.append("Vorgaben: " + ", ".join(parts))
+                if user_valves.show_prompt and used:
+                    out += "\n\n---\n\n*" + " · ".join(used) + "*"
+                return out
+
+        # v0.14.0: connection errors after submission are handled (and the
+        # job withdrawn) inside _render_job; these handlers only cover the
+        # steps before it (option lists, upload, translation).
+        except asyncio.TimeoutError:
+            return "Zeitüberschreitung bei der Verbindung zu ComfyUI."
+        except aiohttp.ClientError as e:
+            return f"Verbindung zu ComfyUI fehlgeschlagen: {e}"
+
+    # ------------------------------------------------------------------
+    # Building blocks shared by single image and series (v0.14.0)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _message_text(msg: dict) -> str:
+        """Text of one chat message; list content is joined from its text parts."""
+        content = (msg or {}).get("content", "")
+        if isinstance(content, list):
+            return "\n".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        return str(content or "")
+
+    @staticmethod
+    def _no_prompt_node_text(name: str) -> str:
+        return (
+            f"Im Workflow **{name}** ist kein Knoten mit dem Titel `{TITLE_PROMPT}` markiert "
+            "und es ließ sich auch keiner herleiten. Bitte in ComfyUI den Knoten umbenennen, "
+            "der den Prompt-Text aufnimmt, und neu als API exportieren."
+        )
+
+    @staticmethod
+    def _no_output_text(name: str) -> str:
+        return (
+            f"**{name}** enthält keinen Bild-Ausgabeknoten (SaveImage oder "
+            "PreviewImage) — ComfyUI würde den Bildzweig gar nicht erst "
+            "ausführen.\n\nMeist ist der Knoten beim Export stummgeschaltet "
+            "oder überbrückt gewesen. In ComfyUI prüfen, dass er aktiv ist, "
+            "und den Workflow neu als API exportieren."
+        )
+
+    def _slot_error_text(self, slot_err: str) -> str:
+        return (
+            f"**GPU-Slot bei Alpaka nicht erhalten** ({slot_err}).\n\n"
+            f"Läuft der Proxy unter `{self._proxy_base()}`? Ohne ihn "
+            "rendert die Pipe nur, wenn die Admin-Valve "
+            "`use_alpaka_proxy` abgeschaltet wird."
+        )
+
+    def _apply_negative(self, wf: dict, h: dict, flags: dict, used: list):
+        if "no" in flags:
+            if h.get("negative"):
+                self._set(wf, h["negative"], flags["no"])
+                used.append(f"negativ: {flags['no']}")
+            else:
+                used.append("negativ: ignoriert (Workflow hat keinen Negativ-Zweig)")
+
+    def _apply_static(self, wf: dict, h: dict, flags: dict, user_valves, used: list):
+        """Steps, cfg/guidance, marker nodes and batch - the settings that
+        are the same for every image of a job or series. Marker nodes that
+        point at model files are returned for the in-session matching."""
         # --- Steps ---
         steps = (
             int(flags["steps"])
@@ -2471,519 +2936,1412 @@ in der Info-Zeile vermerkt.
                     )
                 else:
                     used.append(f"{batch} Bilder")
+        return file_markers
 
-        # --- Report unknown flags instead of swallowing them silently ---
-        unknown = [k for k in flags if k not in self._known_flags(h)]
-        if unknown:
+    async def _prepare_in_session(
+        self,
+        session,
+        base: str,
+        wf: dict,
+        h: dict,
+        flags: dict,
+        user_valves,
+        images_in: list,
+        used: list,
+        file_markers: dict,
+        name: str,
+        emitter,
+        handle_ar: bool = True,
+    ):
+        """Upload the input image, derive the format from it, validate all
+        values against ComfyUI, apply LoRAs and file markers.
+        Returns (flags, ar_from_image, error text or None). With
+        handle_ar=False (series) the format is left to the series plan."""
+        # --- Upload the attached image ---
+        if h.get("image"):
+            if images_in:
+                raw_img, fname = images_in[0]
+                await self._emit(emitter, "Bild wird hochgeladen ...")
+                ref, err = await self._upload_image(session, base, raw_img, fname)
+                if err:
+                    return (
+                        flags,
+                        "",
+                        f"Das Bild konnte nicht an ComfyUI uebergeben werden: {err}",
+                    )
+                self._set(wf, h["image"], ref)
+                used.append(f"Bild: {ref}")
+                if len(images_in) > 1:
+                    used.append(
+                        f"{len(images_in) - 1} weitere(s) Bild(er) ignoriert - "
+                        "dieser Workflow nimmt nur eins"
+                    )
+            else:
+                return (
+                    flags,
+                    "",
+                    f"**{name}** ist ein Bearbeitungs-Workflow und braucht ein Bild.\n\n"
+                    "Häng ein Foto an die Nachricht an (Plus-Symbol neben dem "
+                    "Eingabefeld) und schreib dazu, was geändert werden soll — "
+                    "zum Beispiel „schönes Wetter“.",
+                )
+        elif images_in:
             used.append(
-                "unbekannt und ignoriert: " + ", ".join("--" + u for u in unknown)
+                "Bild angehängt, aber dieser Workflow verarbeitet keins "
+                "(kein PIPE_IMAGE- oder LoadImage-Knoten)"
             )
 
-        # v0.13.3: prompt_id of a job ComfyUI has accepted but whose result
-        # has not arrived yet - set right after submission, cleared once the
-        # history entry is there. The connection-error handlers at the end
-        # withdraw this job before returning, so pipe() does not release the
-        # GPU slot while ComfyUI keeps rendering.
-        open_job: Optional[str] = None
-
-        try:
-            # v0.13.1: transport timeouts only — they detect a dead
-            # socket, they do not give up on a long render. The compute
-            # cap lives in the history loop (timeout_seconds, 0 = off).
-            timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=120)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-
-                for lister, (kind, payload) in listers.items():
-                    if lister not in flags:
-                        continue
-                    needle = str(flags[lister]).strip()
-                    if kind == "loras":
-                        options = await self._lora_options(session, base)
-                        titel = "Verfügbare LoRAs"
-                    elif kind == "resolution":
-                        options = await self._resolution_options(session, base)
-                        titel = "Seitenverhältnisse"
-                    else:
-                        class_type, field, marker_name = payload
-                        options = await self._field_options(
-                            session, base, class_type, field
-                        )
-                        titel = f"Werte für `--{marker_name}`"
-                    if not options:
-                        return (
-                            f"Für `--{lister}` liefert ComfyUI keine Auswahlliste. "
-                            "Entweder hat das Feld keine, oder ComfyUI antwortet nicht."
-                        )
-                    if needle:
-                        shown = [o for o in options if needle.lower() in o.lower()]
-                        if not shown:
-                            return (
-                                f"Keiner der {len(options)} Einträge enthält '{needle}'. "
-                                f"Ohne Filter listet `--{lister}` alle auf."
-                            )
-                        kopf = f"**{titel}** mit '{needle}' ({len(shown)} von {len(options)}):"
-                    else:
-                        shown = options
-                        kopf = f"**{titel}** ({len(options)}):"
-                    return kopf + "\n\n" + "\n".join(f"- `{o}`" for o in shown)
-
-                # --- Upload the attached image ---
-                images_in = self._extract_images(body)
-                if h.get("image"):
-                    if images_in:
-                        raw_img, fname = images_in[0]
-                        await self._emit(__event_emitter__, "Bild wird hochgeladen ...")
-                        ref, err = await self._upload_image(
-                            session, base, raw_img, fname
-                        )
-                        if err:
-                            return f"Das Bild konnte nicht an ComfyUI uebergeben werden: {err}"
-                        self._set(wf, h["image"], ref)
-                        used.append(f"Bild: {ref}")
-                        if len(images_in) > 1:
-                            used.append(
-                                f"{len(images_in) - 1} weitere(s) Bild(er) ignoriert - "
-                                "dieser Workflow nimmt nur eins"
-                            )
-                    else:
-                        return (
-                            f"**{name}** ist ein Bearbeitungs-Workflow und braucht ein Bild.\n\n"
-                            "Häng ein Foto an die Nachricht an (Plus-Symbol neben dem "
-                            "Eingabefeld) und schreib dazu, was geändert werden soll — "
-                            "zum Beispiel „schönes Wetter“."
-                        )
-                elif images_in:
-                    used.append(
-                        "Bild angehängt, aber dieser Workflow verarbeitet keins "
-                        "(kein PIPE_IMAGE- oder LoadImage-Knoten)"
+        # --- Aspect ratio from the attached image ---
+        # Precedence: --ar (message/defaults) > image > aspect_ratio
+        # user valve > workflow file. Only for workflows with an
+        # image input, and only if switched on at every level.
+        ar_from_image = ""
+        if handle_ar:
+            auto_ar = self.valves.auto_ar_from_image and user_valves.auto_ar
+            if "arauto" in flags:
+                auto_ar = self._coerce(flags["arauto"], True)
+            if auto_ar and h.get("image") and images_in and "ar" not in flags:
+                size = self._image_size(images_in[0][0])
+                if not size:
+                    used.append("Format aus Bild: Bildgröße nicht lesbar, Vorgabe bleibt")
+                elif h.get("resolution"):
+                    options = await self._resolution_options(session, base)
+                    chosen = (
+                        self._nearest_ratio_option(options, *size) if options else None
                     )
-
-                # --- Aspect ratio from the attached image ---
-                # Precedence: --ar (message/defaults) > image > aspect_ratio
-                # user valve > workflow file. Only for workflows with an
-                # image input, and only if switched on at every level.
-                ar_from_image = ""
-                auto_ar = self.valves.auto_ar_from_image and user_valves.auto_ar
-                if "arauto" in flags:
-                    auto_ar = self._coerce(flags["arauto"], True)
-                if auto_ar and h.get("image") and images_in and "ar" not in flags:
-                    size = self._image_size(images_in[0][0])
-                    if not size:
-                        used.append(
-                            "Format aus Bild: Bildgröße nicht lesbar, Vorgabe bleibt"
-                        )
-                    elif h.get("resolution"):
-                        options = await self._resolution_options(session, base)
-                        chosen = (
-                            self._nearest_ratio_option(options, *size)
-                            if options
-                            else None
-                        )
-                        if chosen:
-                            flags["ar"] = chosen
-                            ar_from_image = f"{size[0]}x{size[1]}"
-                        else:
-                            used.append(
-                                "Format aus Bild: keine Auswahlliste vom ResolutionSelector, "
-                                "Vorgabe bleibt"
-                            )
-                    elif h.get("dimension_nodes"):
-                        flags["ar"] = f"{size[0]}:{size[1]}"
+                    if chosen:
+                        flags["ar"] = chosen
                         ar_from_image = f"{size[0]}x{size[1]}"
                     else:
                         used.append(
-                            "Format aus Bild: Workflow hat keine setzbare Größe"
+                            "Format aus Bild: keine Auswahlliste vom ResolutionSelector, "
+                            "Vorgabe bleibt"
                         )
+                elif h.get("dimension_nodes"):
+                    flags["ar"] = f"{size[0]}:{size[1]}"
+                    ar_from_image = f"{size[0]}x{size[1]}"
+                else:
+                    used.append("Format aus Bild: Workflow hat keine setzbare Größe")
 
-                # --- Validate all values together once ---
-                # The aspect ratio from the chat controls has to pass through
-                # validation too - otherwise "1:1" instead of "1:1 (Square)"
-                # goes to ComfyUI.
-                if "ar" not in flags and user_valves.aspect_ratio:
-                    flags["ar"] = user_valves.aspect_ratio
-                flags, notes = await self._normalize(session, base, wf, h, flags)
-                used.extend(notes)
+            # --- Validate all values together once ---
+            # The aspect ratio from the chat controls has to pass through
+            # validation too - otherwise "1:1" instead of "1:1 (Square)"
+            # goes to ComfyUI.
+            if "ar" not in flags and user_valves.aspect_ratio:
+                flags["ar"] = user_valves.aspect_ratio
+        flags, notes = await self._normalize(session, base, wf, h, flags)
+        used.extend(notes)
 
-                # --- Apply LoRAs (names are already resolved) ---
-                for i, nid in enumerate(h["loras"], start=1):
-                    key = f"lora{i}"
-                    if key not in flags:
-                        continue
-                    name_value, strength = self._parse_lora_value(flags[key])
-                    if name_value:
-                        wf[nid]["inputs"]["lora_name"] = name_value
-                        used.append(f"{key}: {name_value}")
-                    if strength is not None:
-                        wf[nid]["inputs"]["strength_model"] = strength
-                        used.append(f"{key} Stärke {strength}")
+        # --- Apply LoRAs (names are already resolved) ---
+        for i, nid in enumerate(h["loras"], start=1):
+            key = f"lora{i}"
+            if key not in flags:
+                continue
+            name_value, strength = self._parse_lora_value(flags[key])
+            if name_value:
+                wf[nid]["inputs"]["lora_name"] = name_value
+                used.append(f"{key}: {name_value}")
+            if strength is not None:
+                wf[nid]["inputs"]["strength_model"] = strength
+                used.append(f"{key} Stärke {strength}")
 
-                # --- Markers that point at model files ---
-                for marker_name, handle in file_markers.items():
-                    if marker_name not in flags:
-                        continue
-                    self._set(wf, handle, flags[marker_name])
-                    used.append(f"{marker_name}: {flags[marker_name]}")
+        # --- Markers that point at model files ---
+        for marker_name, handle in file_markers.items():
+            if marker_name not in flags:
+                continue
+            self._set(wf, handle, flags[marker_name])
+            used.append(f"{marker_name}: {flags[marker_name]}")
+        return flags, ar_from_image, None
 
-                # --- GPU slot at Alpaka (v0.13.0) ---
-                # Deliberately only here: uploads and option queries above
-                # need no GPU. From this point on (translation -> ComfyUI
-                # job -> rendering) the slot is held; pipe() releases it in
-                # every end path.
-                if self.valves.use_alpaka_proxy:
-                    slot_tag = str(
-                        (__metadata__ or {}).get("chat_id")
-                        or f"comfy-{random.randint(10000, 99999)}"
+    def _active_triggers(self, wf: dict, h: dict, flags: dict, used: list) -> list:
+        """Trigger words of the active LoRAs, unless --triggers 0. (v0.13.3,
+        shared since v0.14.0)"""
+        triggers = self._triggers_for(wf, h)
+        use_triggers = True
+        if "triggers" in flags:
+            use_triggers = self._coerce(flags["triggers"], True)
+        if triggers and use_triggers:
+            used.append("Trigger: " + ", ".join(triggers))
+            return triggers
+        if triggers:
+            used.append("Trigger abgeschaltet (--triggers 0): " + ", ".join(triggers))
+        return []
+
+    @staticmethod
+    def _megapixels(flags: dict, user_valves) -> float:
+        megapixels = user_valves.megapixels
+        if flags.get("mp"):
+            try:
+                megapixels = float(str(flags["mp"]).replace(",", "."))
+            except ValueError:
+                pass
+        return megapixels
+
+    def _apply_resolution(
+        self,
+        wf: dict,
+        h: dict,
+        ratio_text: str,
+        megapixels: float,
+        ar_from_image: str,
+        used: list,
+    ):
+        """Write format and size into the ResolutionSelector or into all
+        nodes with literal width/height fields."""
+        if h.get("resolution"):
+            node = wf[h["resolution"]]["inputs"]
+            if ratio_text:
+                node["aspect_ratio"] = ratio_text
+                used.append(
+                    f"Format {ratio_text}"
+                    + (f" (aus Bild {ar_from_image})" if ar_from_image else "")
+                )
+            if megapixels > 0:
+                node["megapixels"] = megapixels
+                used.append(f"{megapixels} MP")
+        elif h.get("dimension_nodes"):
+            targets = h["dimension_nodes"]
+            lead = wf[h.get("latent") or targets[0]]["inputs"]
+            ratio = self._aspect(ratio_text) if ratio_text else None
+            if ratio or megapixels > 0:
+                cur_w = float(lead.get("width", 1024))
+                cur_h = float(lead.get("height", 1024))
+                ratio = ratio or (cur_w / cur_h)
+                total = (megapixels or (cur_w * cur_h / 1_000_000)) * 1_000_000
+                w = int(round(math.sqrt(total * ratio) / 16) * 16)
+                hh = int(round((total / max(w, 1)) / 16) * 16)
+                for nid in targets:
+                    wf[nid]["inputs"]["width"] = w
+                    wf[nid]["inputs"]["height"] = hh
+                extra = f" (in {len(targets)} Knoten gesetzt)" if len(targets) > 1 else ""
+                if ar_from_image:
+                    extra += f" (Format aus Bild {ar_from_image})"
+                used.append(f"{w}x{hh}{extra}")
+
+    async def _render_job(
+        self,
+        session,
+        base: str,
+        wf: dict,
+        h: dict,
+        label: str,
+        emitter,
+        user_id,
+        fetch_status: str = "Bilder werden abgeholt ...",
+    ) -> dict:
+        """Submit one prepared workflow, wait for it, fetch the images.
+        Shared by single image and series (v0.14.0). Never returns with a
+        job still rendering: compute cap and connection errors withdraw it
+        first (v0.13.3); the stop button raises CancelledError with the
+        clean-up result attached as .comfy_note.
+
+        Returns a dict with kind:
+          "ok"    - blocks (markdown image lines), refined, notes
+          "error" - a failure of this job: text (full message), short
+                    (one line for series), detail (optional), notes
+          "conn"  - ComfyUI unreachable: text, short, notes"""
+        notes: list[str] = []
+        # prompt_id of a job ComfyUI has accepted but whose result has not
+        # arrived yet - the connection-error handlers withdraw it (v0.13.3)
+        open_job: Optional[str] = None
+        try:
+            attempts = 2 if self.valves.retry_on_error else 1
+            history = None
+            error_status = None
+            for attempt in range(1, attempts + 1):
+                if attempt > 1:
+                    notes.append(
+                        "Erster Versuch von ComfyUI abgebrochen — automatisch wiederholt"
                     )
-                    slot_id, slot_err = await self._acquire_slot(
-                        __event_emitter__, name, slot_tag
-                    )
-                    if slot_err:
-                        return (
-                            f"**GPU-Slot bei Alpaka nicht erhalten** ({slot_err}).\n\n"
-                            f"Läuft der Proxy unter `{self._proxy_base()}`? Ohne ihn "
-                            "rendert die Pipe nur, wenn die Admin-Valve "
-                            "`use_alpaka_proxy` abgeschaltet wird."
-                        )
-                    _slot_ctx["slot_id"] = slot_id
-                    _slot_ctx["hb_task"] = asyncio.create_task(
-                        self._heartbeat_loop(slot_id, _slot_ctx["state"])
-                    )
-
-                # --- Translation ---
-                final_prompt = prompt
-                do_translate = user_valves.translate
-                if "translate" in flags:
-                    do_translate = self._coerce(flags["translate"], True)
-                if do_translate and self.valves.translate_model:
-                    await self._emit(__event_emitter__, "Prompt wird übersetzt ...")
-                    masked, kept = self._protect(prompt)
-                    english, err = await self._translate(
-                        session, masked, _slot_ctx["slot_id"]
-                    )
-                    if err:
-                        used.append(
-                            f"Übersetzung fehlgeschlagen ({err}), Original verwendet"
-                        )
-                    elif english:
-                        final_prompt = self._restore(english, kept)
-                        if final_prompt.strip() == prompt.strip():
-                            used.append(
-                                f"{self.valves.translate_model} hat den Text unverändert zurückgegeben"
-                            )
-                        else:
-                            used.append(f"übersetzt mit {self.valves.translate_model}")
-                    if h.get("negative") and flags.get("no"):
-                        neg_en, neg_err = await self._translate(
-                            session, flags["no"], _slot_ctx["slot_id"]
-                        )
-                        if neg_en and not neg_err:
-                            self._set(wf, h["negative"], neg_en)
-                elif do_translate:
-                    used.append(
-                        "Übersetzung angefordert, aber kein Modell in den Valves gesetzt"
+                    await self._emit(
+                        emitter, f"{label} Abbruch, zweiter Versuch läuft ..."
                     )
                 else:
-                    used.append("ohne Übersetzung")
+                    await self._emit(emitter, f"{label} Auftrag geht raus ...")
 
-                # --- Trigger words of the active LoRAs ---
-                # v0.13.3: --triggers 0 (message or saved default) switches
-                # them off; default on, as documented in the manual.
-                triggers = self._triggers_for(wf, h)
-                use_triggers = True
-                if "triggers" in flags:
-                    use_triggers = self._coerce(flags["triggers"], True)
-                if triggers and use_triggers:
-                    final_prompt = (
-                        final_prompt.rstrip(" ,.") + ", " + ", ".join(triggers)
-                    )
-                    used.append("Trigger: " + ", ".join(triggers))
-                elif triggers:
-                    used.append(
-                        "Trigger abgeschaltet (--triggers 0): " + ", ".join(triggers)
-                    )
-
-                self._set(wf, h["prompt"], final_prompt)
-                used.append(f"Prompt: {final_prompt}")
-
-                # --- Resolution ---
-                ratio_text = flags.get("ar", "")
-                megapixels = user_valves.megapixels
-                if flags.get("mp"):
-                    try:
-                        megapixels = float(flags["mp"].replace(",", "."))
-                    except ValueError:
-                        pass
-
-                if h.get("resolution"):
-                    node = wf[h["resolution"]]["inputs"]
-                    if ratio_text:
-                        node["aspect_ratio"] = ratio_text
-                        used.append(
-                            f"Format {ratio_text}"
-                            + (f" (aus Bild {ar_from_image})" if ar_from_image else "")
-                        )
-                    if megapixels > 0:
-                        node["megapixels"] = megapixels
-                        used.append(f"{megapixels} MP")
-                elif h.get("dimension_nodes"):
-                    targets = h["dimension_nodes"]
-                    lead = wf[h.get("latent") or targets[0]]["inputs"]
-                    ratio = self._aspect(ratio_text) if ratio_text else None
-                    if ratio or megapixels > 0:
-                        cur_w = float(lead.get("width", 1024))
-                        cur_h = float(lead.get("height", 1024))
-                        ratio = ratio or (cur_w / cur_h)
-                        total = (megapixels or (cur_w * cur_h / 1_000_000)) * 1_000_000
-                        w = int(round(math.sqrt(total * ratio) / 16) * 16)
-                        hh = int(round((total / max(w, 1)) / 16) * 16)
-                        for nid in targets:
-                            wf[nid]["inputs"]["width"] = w
-                            wf[nid]["inputs"]["height"] = hh
-                        extra = (
-                            f" (in {len(targets)} Knoten gesetzt)"
-                            if len(targets) > 1
-                            else ""
-                        )
-                        if ar_from_image:
-                            extra += f" (Format aus Bild {ar_from_image})"
-                        used.append(f"{w}x{hh}{extra}")
-
-                if not h.get("outputs"):
-                    return (
-                        f"**{name}** enthält keinen Bild-Ausgabeknoten (SaveImage oder "
-                        "PreviewImage) — ComfyUI würde den Bildzweig gar nicht erst "
-                        "ausführen.\n\nMeist ist der Knoten beim Export stummgeschaltet "
-                        "oder überbrückt gewesen. In ComfyUI prüfen, dass er aktiv ist, "
-                        "und den Workflow neu als API exportieren."
-                    )
-
-                # --- Submit the job (exactly one second attempt on abort) ---
-                attempts = 2 if self.valves.retry_on_error else 1
-                history = None
-                error_status = None
-                for attempt in range(1, attempts + 1):
-                    if attempt > 1:
-                        used.append(
-                            "Erster Versuch von ComfyUI abgebrochen — automatisch wiederholt"
-                        )
-                        await self._emit(
-                            __event_emitter__,
-                            f"{name}: Abbruch, zweiter Versuch läuft ...",
-                        )
-                    else:
-                        await self._emit(
-                            __event_emitter__, f"{name}: Auftrag geht raus ..."
-                        )
-
-                    async with session.post(
-                        f"{base}/prompt", json={"prompt": wf}
-                    ) as resp:
-                        if resp.status != 200:
-                            detail = await resp.text()
-                            return (
+                async with session.post(f"{base}/prompt", json={"prompt": wf}) as resp:
+                    if resp.status != 200:
+                        detail = await resp.text()
+                        return {
+                            "kind": "error",
+                            "short": f"von ComfyUI abgelehnt (HTTP {resp.status})",
+                            "detail": _clip_middle(detail, 1200),
+                            "text": (
                                 f"ComfyUI hat den Auftrag abgelehnt (HTTP {resp.status}):\n\n"
                                 f"```\n{_clip_middle(detail)}\n```"
-                            )
-                        submitted = await resp.json()
-                        prompt_id = submitted["prompt_id"]
-                        open_job = prompt_id  # v0.13.3: withdraw on connection loss
-                        node_errors = submitted.get("node_errors") or {}
-                        if node_errors and attempt == 1:
-                            problems = []
-                            for nid, err in node_errors.items():
-                                title = (wf.get(nid, {}).get("_meta") or {}).get(
-                                    "title", ""
+                            ),
+                            "notes": notes,
+                        }
+                    submitted = await resp.json()
+                    prompt_id = submitted["prompt_id"]
+                    open_job = prompt_id  # v0.13.3: withdraw on connection loss
+                    node_errors = submitted.get("node_errors") or {}
+                    if node_errors and attempt == 1:
+                        problems = []
+                        for nid, err in node_errors.items():
+                            title = (wf.get(nid, {}).get("_meta") or {}).get("title", "")
+                            label_node = f"{nid} ({wf.get(nid, {}).get('class_type', '?')}"
+                            label_node += f", {title})" if title else ")"
+                            for detail in err.get("errors") or []:
+                                problems.append(
+                                    f"- {label_node}: {detail.get('message', '?')} "
+                                    f"{detail.get('details', '')}".rstrip()
                                 )
-                                label = (
-                                    f"{nid} ({wf.get(nid, {}).get('class_type', '?')}"
-                                )
-                                label += f", {title})" if title else ")"
-                                for detail in err.get("errors") or []:
-                                    problems.append(
-                                        f"- {label}: {detail.get('message', '?')} "
-                                        f"{detail.get('details', '')}".rstrip()
-                                    )
-                            used.append(
-                                "ComfyUI hat Knoten beanstandet — der betroffene Zweig "
-                                "läuft nicht:\n" + "\n".join(problems)
-                            )
-
-                    history = None
-                    started = time.monotonic()
-                    try:
-                        while True:
-                            elapsed = time.monotonic() - started
-                            if (
-                                self.valves.timeout_seconds
-                                and elapsed > self.valves.timeout_seconds
-                            ):
-                                break  # v0.13.1: 0 = no compute cap
-                            async with session.get(
-                                f"{base}/history/{prompt_id}"
-                            ) as resp:
-                                data = await resp.json()
-                            if prompt_id in data:
-                                history = data[prompt_id]
-                                open_job = None  # result is there, nothing to withdraw
-                                break
-                            position = await self._queue_position(
-                                session, base, prompt_id
-                            )
-                            if position:
-                                text = f"{name}: wartet, Position {position} in der Warteschlange"
-                            else:
-                                suffix = " (2. Versuch)" if attempt > 1 else ""
-                                text = f"{name}: rechnet{suffix} ... ({int(elapsed)} s)"
-                            await self._emit(__event_emitter__, text)
-                            await asyncio.sleep(1.5)
-                    except asyncio.CancelledError as e:
-                        # Stop button in Open WebUI: withdraw the job from
-                        # ComfyUI. shield, so the cleanup completes even on a
-                        # second cancel.
-                        e.comfy_note = await asyncio.shield(
-                            self._abort_job(base, prompt_id)
+                        notes.append(
+                            "ComfyUI hat Knoten beanstandet — der betroffene Zweig "
+                            "läuft nicht:\n" + "\n".join(problems)
                         )
-                        raise
 
-                    if history is None:
-                        # v0.13.3: compute cap reached - withdraw the job
-                        # (same clean-up as the stop button) BEFORE pipe()
-                        # releases the GPU slot. shield: completes even on
-                        # a stop during the clean-up.
-                        note = await asyncio.shield(self._abort_job(base, prompt_id))
-                        open_job = None
-                        return (
+                history = None
+                started = time.monotonic()
+                try:
+                    while True:
+                        elapsed = time.monotonic() - started
+                        if (
+                            self.valves.timeout_seconds
+                            and elapsed > self.valves.timeout_seconds
+                        ):
+                            break  # v0.13.1: 0 = no compute cap
+                        async with session.get(f"{base}/history/{prompt_id}") as resp:
+                            data = await resp.json()
+                        if prompt_id in data:
+                            history = data[prompt_id]
+                            open_job = None  # result is there, nothing to withdraw
+                            break
+                        position = await self._queue_position(session, base, prompt_id)
+                        if position:
+                            text = f"{label} wartet, Position {position} in der Warteschlange"
+                        else:
+                            suffix = " (2. Versuch)" if attempt > 1 else ""
+                            text = f"{label} rechnet{suffix} ... ({int(elapsed)} s)"
+                        await self._emit(emitter, text)
+                        await asyncio.sleep(1.5)
+                except asyncio.CancelledError as e:
+                    # Stop button in Open WebUI: withdraw the job from
+                    # ComfyUI. shield, so the cleanup completes even on a
+                    # second cancel.
+                    e.comfy_note = await asyncio.shield(self._abort_job(base, prompt_id))
+                    raise
+
+                if history is None:
+                    # v0.13.3: compute cap reached - withdraw the job (same
+                    # clean-up as the stop button) BEFORE the GPU slot is
+                    # released. shield: completes even on a stop during the
+                    # clean-up.
+                    note = await asyncio.shield(self._abort_job(base, prompt_id))
+                    open_job = None
+                    return {
+                        "kind": "error",
+                        "short": f"Zeitüberschreitung ({note})",
+                        "text": (
                             "**Zeitüberschreitung:** ComfyUI hat den Auftrag nicht "
                             f"innerhalb von {_duration(self.valves.timeout_seconds)} "
                             "abgeschlossen (Admin-Valve `timeout_seconds`)."
                             + self._abort_suffix(note)
-                        )
-
-                    status = history.get("status", {})
-                    if status.get("status_str") != "error":
-                        error_status = None
-                        break
-                    # Abort: retry silently the first time, report otherwise
-                    error_status = status
-
-                if error_status is not None:
-                    prefix = (
-                        "ComfyUI meldet einen Fehler"
-                        if attempts == 1
-                        else "ComfyUI meldet einen Fehler (auch beim zweiten Versuch)"
-                    )
-                    return (
-                        f"{prefix}:\n\n```\n"
-                        f"{_clip_middle(json.dumps(error_status, indent=2, ensure_ascii=False))}\n```"
-                        + _RESET_HINT
-                    )
-
-                outputs = history.get("outputs", {}) or {}
-
-                refined = None
-                if h.get("prompt_result"):
-                    entry = outputs.get(h["prompt_result"]) or {}
-                    for key in ("text", "string", "value", "result"):
-                        val = entry.get(key)
-                        if isinstance(val, list) and val:
-                            val = val[0]
-                        if isinstance(val, str) and val.strip():
-                            refined = val.strip()
-                            break
-
-                images = []
-                for out in outputs.values():
-                    for key in ("images", "result", "ui_images"):
-                        entries = out.get(key) or []
-                        if isinstance(entries, dict):
-                            entries = entries.get("images") or []
-                        for entry in entries:
-                            if isinstance(entry, dict) and entry.get("filename"):
-                                images.append(entry)
-                if not images:
-                    detail = {
-                        nid: sorted((outputs.get(nid) or {}).keys()) for nid in outputs
+                        ),
+                        "notes": notes,
                     }
-                    hint = ""
-                    if outputs:
-                        hint = (
-                            "\n\nHäufigste Ursache: **ComfyUIs Zwischenspeicher**. Wenn sich "
-                            "gegenüber dem letzten Auftrag kein einziger Wert geändert hat — "
-                            "typischerweise durch einen fest gespeicherten Seed — rechnet ComfyUI "
-                            "nichts neu und meldet die Bilder nicht erneut."
-                        )
-                    if not outputs:
-                        hint = (
-                            "\n\nComfyUI hat gar keine Ausgaben gemeldet. Das passiert, wenn der "
-                            "Workflow keinen SaveImage- oder PreviewImage-Knoten enthält oder wenn "
-                            "der Ausgabezweig im Export deaktiviert (bypassed) war."
-                        )
-                    return (
+
+                status = history.get("status", {})
+                if status.get("status_str") != "error":
+                    error_status = None
+                    break
+                # Abort: retry silently the first time, report otherwise
+                error_status = status
+
+            if error_status is not None:
+                prefix = (
+                    "ComfyUI meldet einen Fehler"
+                    if attempts == 1
+                    else "ComfyUI meldet einen Fehler (auch beim zweiten Versuch)"
+                )
+                dump = json.dumps(error_status, indent=2, ensure_ascii=False)
+                return {
+                    "kind": "error",
+                    "short": prefix,
+                    "detail": _clip_middle(dump, 1200),
+                    "text": f"{prefix}:\n\n```\n{_clip_middle(dump)}\n```" + _RESET_HINT,
+                    "notes": notes,
+                }
+
+            outputs = history.get("outputs", {}) or {}
+
+            refined = None
+            if h.get("prompt_result"):
+                entry = outputs.get(h["prompt_result"]) or {}
+                for key in ("text", "string", "value", "result"):
+                    val = entry.get(key)
+                    if isinstance(val, list) and val:
+                        val = val[0]
+                    if isinstance(val, str) and val.strip():
+                        refined = val.strip()
+                        break
+
+            images = []
+            for out in outputs.values():
+                for key in ("images", "result", "ui_images"):
+                    entries = out.get(key) or []
+                    if isinstance(entries, dict):
+                        entries = entries.get("images") or []
+                    for entry in entries:
+                        if isinstance(entry, dict) and entry.get("filename"):
+                            images.append(entry)
+            if not images:
+                detail = {
+                    nid: sorted((outputs.get(nid) or {}).keys()) for nid in outputs
+                }
+                hint = ""
+                if outputs:
+                    hint = (
+                        "\n\nHäufigste Ursache: **ComfyUIs Zwischenspeicher**. Wenn sich "
+                        "gegenüber dem letzten Auftrag kein einziger Wert geändert hat — "
+                        "typischerweise durch einen fest gespeicherten Seed — rechnet ComfyUI "
+                        "nichts neu und meldet die Bilder nicht erneut."
+                    )
+                if not outputs:
+                    hint = (
+                        "\n\nComfyUI hat gar keine Ausgaben gemeldet. Das passiert, wenn der "
+                        "Workflow keinen SaveImage- oder PreviewImage-Knoten enthält oder wenn "
+                        "der Ausgabezweig im Export deaktiviert (bypassed) war."
+                    )
+                return {
+                    "kind": "error",
+                    "short": "kein Bild",
+                    "text": (
                         "ComfyUI ist durchgelaufen, hat aber kein Bild zurückgegeben."
                         f"{hint}\n\nGemeldete Ausgaben je Knoten:\n\n```\n"
                         f"{_clip_middle(json.dumps(detail, indent=1, ensure_ascii=False), 1500)}\n```"
                         + _RESET_HINT
-                    )
+                    ),
+                    "notes": notes,
+                }
 
-                await self._emit(__event_emitter__, "Bilder werden abgeholt ...")
-                blocks = []
-                store_error = None
-                for img in images:
-                    params = {
-                        "filename": img["filename"],
-                        "subfolder": img.get("subfolder", ""),
-                        "type": img.get("type", "output"),
-                    }
-                    async with session.get(f"{base}/view", params=params) as resp:
-                        data = await resp.read()
+            await self._emit(emitter, fetch_status)
+            blocks = []
+            store_error = None
+            for img in images:
+                params = {
+                    "filename": img["filename"],
+                    "subfolder": img.get("subfolder", ""),
+                    "type": img.get("type", "output"),
+                }
+                async with session.get(f"{base}/view", params=params) as resp:
+                    data = await resp.read()
 
-                    url = None
-                    if self.valves.store_images_as_files:
-                        url, err = await self._store_image(
-                            data, img["filename"], user_id
-                        )
-                        if err and not store_error:
-                            store_error = err
-                    if url:
-                        blocks.append(f"![{img['filename']}]({url})")
-                    else:
-                        b64 = base64.b64encode(data).decode()
-                        mime = _mime_for(img["filename"])
-                        blocks.append(
-                            f"![{img['filename']}](data:{mime};base64,{b64})"
-                        )
+                url = None
+                if self.valves.store_images_as_files:
+                    url, err = await self._store_image(data, img["filename"], user_id)
+                    if err and not store_error:
+                        store_error = err
+                if url:
+                    blocks.append(f"![{img['filename']}]({url})")
+                else:
+                    b64 = base64.b64encode(data).decode()
+                    mime = _mime_for(img["filename"])
+                    blocks.append(f"![{img['filename']}](data:{mime};base64,{b64})")
 
-                if store_error:
-                    used.append(f"Dateiablage übersprungen ({store_error})")
-                if _slot_ctx["state"].get("lost"):
-                    used.append(
-                        "Hinweis: die GPU-Slot-Lease war zwischenzeitlich verfallen "
-                        "(Alpaka neu gestartet?) — der Auftrag lief trotzdem weiter"
-                    )
-
-                await self._emit(__event_emitter__, "Fertig", done=True)
-                out = "\n\n".join(blocks)
-                if refined:
-                    out += f"\n\n---\n\n**Verwendeter Prompt:**\n\n{refined}"
-                if defaults and user_valves.show_prompt:
-                    parts = []
-                    for k, v in defaults.items():
-                        if k in msg_flags and str(msg_flags[k]) != str(v):
-                            parts.append(
-                                f"--{k} {msg_flags[k]} (Vorgabe {v} übersteuert)".rstrip()
-                            )
-                        else:
-                            parts.append(f"--{k} {v}".rstrip())
-                    used.append("Vorgaben: " + ", ".join(parts))
-                if user_valves.show_prompt and used:
-                    out += "\n\n---\n\n*" + " · ".join(used) + "*"
-                return out
+            if store_error:
+                notes.append(f"Dateiablage übersprungen ({store_error})")
+            return {"kind": "ok", "blocks": blocks, "refined": refined, "notes": notes}
 
         except asyncio.TimeoutError:
-            return "Zeitüberschreitung bei der Verbindung zu ComfyUI." + (
-                await self._withdraw_open_job(base, open_job)
-            )
+            return {
+                "kind": "conn",
+                "short": "Zeitüberschreitung bei der Verbindung zu ComfyUI",
+                "text": "Zeitüberschreitung bei der Verbindung zu ComfyUI."
+                + (await self._withdraw_open_job(base, open_job)),
+                "notes": notes,
+            }
         except aiohttp.ClientError as e:
-            return f"Verbindung zu ComfyUI fehlgeschlagen: {e}" + (
-                await self._withdraw_open_job(base, open_job)
+            return {
+                "kind": "conn",
+                "short": f"Verbindung zu ComfyUI fehlgeschlagen ({e})",
+                "text": f"Verbindung zu ComfyUI fehlgeschlagen: {e}"
+                + (await self._withdraw_open_job(base, open_job)),
+                "notes": notes,
+            }
+
+    # ------------------------------------------------------------------
+    # Image series (v0.14.0)
+    # ------------------------------------------------------------------
+
+    async def _series_entry(
+        self,
+        body: dict,
+        __user__: Optional[dict],
+        emitter,
+        __metadata__: Optional[dict],
+        pipe_id: str,
+        wf: dict,
+        name: str,
+        h: dict,
+        prompt: str,
+        flags: dict,
+    ):
+        """Dispatch --serie (list phase, optionally rendering right away
+        with --nowait) and --los (render a list from the chat)."""
+        if "serie" in flags and "los" in flags:
+            return (
+                "`--serie` und `--los` bitte nicht in derselben Nachricht verwenden — "
+                "erst die Liste erzeugen, dann mit `--los` starten."
             )
+        if "nowait" in flags and "serie" not in flags:
+            return (
+                "`--nowait` gehört zu `--serie`, zum Beispiel:\n\n"
+                "`Katze in vier Jahreszeiten, Fotostil --serie 5 --nowait`"
+            )
+        if not h.get("prompt"):
+            return self._no_prompt_node_text(name)
+        if not h.get("outputs"):
+            return self._no_output_text(name)
+
+        user = __user__ or {}
+        ctx = {
+            "body": body,
+            "emitter": emitter,
+            "metadata": __metadata__ or {},
+            "user_id": user.get("id"),
+            "user_valves": user.get("valves") or self.UserValves(),
+            "pipe_id": pipe_id,
+            "wf": wf,
+            "name": name,
+            "h": h,
+            "defaults": self._load_defaults(user.get("id"), pipe_id),
+            "hints": [],
+            "info": [],
+        }
+        if "serie" in flags:
+            return await self._series_list_phase(ctx, prompt, flags)
+        return await self._series_los_phase(ctx, flags)
+
+    @staticmethod
+    def _series_layer(flags: dict) -> dict:
+        """Flags of one message without the commands (they are never
+        values of a job and never saved)."""
+        return {
+            k: v
+            for k, v in flags.items()
+            if k not in SERIES_FLAGS and k not in COMMAND_FLAGS
+        }
+
+    def _layer_flags(self, base: dict, layer: dict) -> dict:
+        """Lay one message's flags over a lower layer, with the same rules
+        as a single image over its saved defaults: a bare flag drops the
+        value for this run, LoRA name and strength merge separately."""
+        bare = {k for k, v in layer.items() if not str(v).strip()}
+        out = {**base, **layer}
+        for k, v in layer.items():
+            if k in bare:
+                continue
+            if re.fullmatch(r"lora\d+", k) and k in base:
+                out[k] = self._merge_lora_value(base[k], v)
+        for k in bare:
+            out.pop(k, None)
+        return out
+
+    def _series_count(self, value, hints: list) -> int:
+        maximum = max(1, int(self.valves.series_max))
+        text = str(value or "").strip()
+        if not text:
+            n = SERIES_DEFAULT_COUNT
+        elif text.isdigit():
+            n = int(text)
+        else:
+            hints.append(
+                f"`--serie {text}` ist keine Zahl — es gilt {SERIES_DEFAULT_COUNT}"
+            )
+            n = SERIES_DEFAULT_COUNT
+        if n < 1:
+            hints.append("mindestens 1 Prompt")
+            n = 1
+        if n > maximum:
+            hints.append(
+                f"{n} Prompts auf {maximum} begrenzt (Admin-Valve `series_max`)"
+            )
+            n = maximum
+        return n
+
+    def _series_words(self, flags: dict, user_valves, hints: list) -> int:
+        raw = flags.get("words")
+        words = user_valves.series_words
+        if raw is not None and str(raw).strip():
+            text = str(raw).strip()
+            try:
+                words = int(float(text.replace(",", ".")))
+            except ValueError:
+                hints.append(
+                    f"`--words {text}` ist keine Zahl — es gilt der Wert aus der "
+                    "Chat-Steuerung"
+                )
+        if words < 0:
+            words = 0
+        if words > SERIES_WORDS_MAX:
+            hints.append(f"Länge {words} Wörter auf {SERIES_WORDS_MAX} begrenzt")
+            words = SERIES_WORDS_MAX
+        return words
+
+    def _series_match_ar(self, value: str, h: dict, options_full: list):
+        """Map a user-given ratio to what the workflow takes: the full
+        ResolutionSelector entry, or W:H for plain width/height nodes."""
+        value = str(value).strip()
+        if h.get("resolution"):
+            for o in options_full:
+                if o == value or o.split(" ")[0] == value:
+                    return o
+            return None
+        if h.get("dimension_nodes"):
+            return value if self._aspect(value) else None
+        return None
+
+    async def _series_ar_plan(
+        self, h: dict, flags: dict, ar_from_msg: bool, user_valves, images_in: list
+    ) -> dict:
+        """Who decides the format of a series: --ar > input image > user
+        valve > the LLM per prompt > workflow file. A fixed format is named
+        once in the list header and the LLM is not asked for one."""
+        notes: list[str] = []
+        base = self.valves.comfy_url.rstrip("/")
+        options_full: list[str] = []
+        short_to_full: dict = {}
+        if h.get("resolution"):
+            try:
+                timeout = aiohttp.ClientTimeout(total=20)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    options_full = await self._resolution_options(session, base)
+            except Exception:
+                options_full = []
+            for o in options_full:
+                short = o.split(" ")[0]
+                if self._aspect(short) and short not in short_to_full:
+                    short_to_full[short] = o
+            if not options_full:
+                notes.append(
+                    "Formatliste des ResolutionSelectors nicht erhalten (ComfyUI "
+                    "erreichbar?) — Format wie im Workflow"
+                )
+        elif h.get("dimension_nodes"):
+            for part in re.split(r"[,;]", self.valves.series_ar_options or ""):
+                short = part.strip()
+                if short and self._aspect(short) and short not in short_to_full:
+                    short_to_full[short] = short
+        settable = bool(short_to_full) or bool(
+            h.get("dimension_nodes") and not h.get("resolution")
+        )
+
+        def fixed(value_full: str, display: str, source: str) -> dict:
+            return {
+                "mode": "fixed",
+                "value_full": value_full,
+                "display": display,
+                "source": source,
+                "short_to_full": short_to_full,
+                "notes": notes,
+            }
+
+        workflow_plan = {
+            "mode": "workflow",
+            "value_full": "",
+            "display": "",
+            "source": "",
+            "short_to_full": short_to_full,
+            "notes": notes,
+        }
+        if not settable:
+            return workflow_plan
+
+        # 1. --ar (message or saved default)
+        ar = str(flags.get("ar", "") or "").strip()
+        if ar:
+            full = self._series_match_ar(ar, h, options_full)
+            if full:
+                return fixed(
+                    full,
+                    full.split(" ")[0],
+                    "--ar" if ar_from_msg else "gespeicherte Vorgabe",
+                )
+            notes.append(f"`--ar {ar}`: Format unbekannt — ignoriert")
+
+        # 2. input image (same switches as the single image)
+        auto_ar = self.valves.auto_ar_from_image and user_valves.auto_ar
+        if "arauto" in flags:
+            auto_ar = self._coerce(flags["arauto"], True)
+        if auto_ar and h.get("image") and images_in:
+            size = self._image_size(images_in[0][0])
+            if not size:
+                notes.append("Format aus Bild: Bildgröße nicht lesbar")
+            else:
+                w, hh = size
+                source = f"Bild-Input (aus Bild {w}x{hh})"
+                if h.get("resolution"):
+                    chosen = (
+                        self._nearest_ratio_option(options_full, w, hh)
+                        if options_full
+                        else None
+                    )
+                    if chosen:
+                        return fixed(chosen, chosen.split(" ")[0], source)
+                else:
+                    g = math.gcd(w, hh) or 1
+                    return fixed(f"{w}:{hh}", f"{w // g}:{hh // g}", source)
+
+        # 3. user valve
+        uv = str(user_valves.aspect_ratio or "").strip()
+        if uv:
+            full = self._series_match_ar(uv, h, options_full)
+            if full:
+                return fixed(full, full.split(" ")[0], "User-Valve")
+            notes.append(f"User-Valve `aspect_ratio` {uv}: Format unbekannt — ignoriert")
+
+        # 4. the LLM chooses per prompt
+        if short_to_full:
+            return {
+                "mode": "llm",
+                "value_full": "",
+                "display": "",
+                "source": "LLM",
+                "short_to_full": short_to_full,
+                "notes": notes,
+            }
+        return workflow_plan
+
+    @staticmethod
+    def _series_format_header(plan: dict) -> str:
+        if plan["mode"] == "fixed":
+            return f"Format: {plan['display']}, fixiert über {plan['source']}"
+        if plan["mode"] == "llm":
+            return "Format: je Prompt vom LLM gewählt"
+        return "Format: wie im Workflow"
+
+    async def _series_list_phase(self, ctx: dict, prompt: str, flags: dict):
+        """--serie: let the prompt LLM write the list; with --nowait render
+        it right away."""
+        v = self.valves
+        hints, info = ctx["hints"], ctx["info"]
+        user_valves = ctx["user_valves"]
+        if not v.series_model.strip():
+            return (
+                "**Serienmodus nicht verfügbar:** in den Admin-Valves ist kein "
+                "`series_model` gesetzt."
+            )
+        vorgabe = " ".join(prompt.split())
+        if not vorgabe:
+            return (
+                "Für eine Serie fehlt die Vorgabe. Der Text steht **vor** den Kürzeln, "
+                "zum Beispiel:\n\n`Katze in vier Jahreszeiten, Fotostil --serie 10`"
+            )
+        n = self._series_count(flags.get("serie", ""), hints)
+        nowait = "nowait" in flags
+        layer = self._series_layer(flags)
+        eff = self._layer_flags(ctx["defaults"], layer)
+        words = self._series_words(eff, user_valves, hints)
+        eff.pop("words", None)
+
+        system_prompt, had_memory, had_summary = self._system_prompt(ctx["body"])
+        if had_memory:
+            info.append("Gedächtnis-Block aus dem Systemprompt entfernt")
+        if had_summary:
+            info.append(
+                "Chat-Zusammenfassung (Context Compaction) aus dem Systemprompt entfernt"
+            )
+        if system_prompt:
+            info.append("Systemprompt als feste Vorgabe an das Prompt-Modell übergeben")
+
+        images_in = self._extract_images(ctx["body"])
+        plan = await self._series_ar_plan(
+            ctx["h"],
+            eff,
+            bool(str(layer.get("ar", "")).strip()),
+            user_valves,
+            images_in,
+        )
+        hints.extend(plan["notes"])
+        ar_options = list(plan["short_to_full"]) if plan["mode"] == "llm" else None
+
+        await self._emit(ctx["emitter"], "Serie: Prompts werden erstellt ...")
+        items, err, gen_notes = await self._series_generate(
+            ctx["emitter"], vorgabe, n, words, system_prompt, ar_options
+        )
+        if err:
+            return err
+        hints.extend(gen_notes)
+        info.append(f"Prompt-Modell: {v.series_model.strip()}")
+
+        list_block = self._series_list_block(
+            ctx["name"], items, plan, words, vorgabe, nowait
+        )
+        if not nowait:
+            out = list_block
+            if hints:
+                out += "\n\n*Hinweise: " + " · ".join(hints) + "*"
+            if user_valves.show_prompt and info:
+                out += "\n\n---\n\n*" + " · ".join(info) + "*"
+            return out
+
+        entries = [
+            (i, it["prompt"], it.get("ar")) for i, it in enumerate(items, start=1)
+        ]
+        return await self._series_prepare_render(
+            ctx, entries, eff, images_in, plan, list_block
+        )
+
+    def _series_list_block(
+        self,
+        name: str,
+        items: list,
+        plan: dict,
+        words: int,
+        vorgabe: str,
+        nowait: bool,
+    ) -> str:
+        avg = round(sum(len(it["prompt"].split()) for it in items) / len(items))
+        length = (
+            f"Länge: ~{words} Wörter (Ø {avg})" if words > 0 else f"Länge: Ø {avg} Wörter"
+        )
+        head = (
+            f"{LIST_HEADER} · {name} · {len(items)} Prompts · "
+            f"{self._series_format_header(plan)} · {length}"
+        )
+        lines = [head, "", f"Vorgabe: {vorgabe}", ""]
+        for i, it in enumerate(items, start=1):
+            tag = f"[{it['ar']}] " if plan["mode"] == "llm" and it.get("ar") else ""
+            lines.append(f"{i}. {tag}{it['prompt']}")
+        lines.append("")
+        if nowait:
+            lines.append(
+                "Läuft sofort (`--nowait`). Später erneut rendern: `--los` bzw. "
+                "`--los 1,3,7` – auch nach Bearbeiten der Liste."
+            )
+        else:
+            lines.append(
+                "Starten mit `--los`, Auswahl mit `--los 1,3,7`. Die Liste lässt sich "
+                "vorher über die Bearbeiten-Funktion ändern – es gilt der bearbeitete Stand."
+            )
+        return "\n".join(lines)
+
+    async def _series_generate(
+        self,
+        emitter,
+        vorgabe: str,
+        n: int,
+        words: int,
+        fixed: str,
+        ar_options: Optional[list],
+    ):
+        """Ask the prompt LLM (via ollama_url, i.e. through Alpaka's normal
+        queue - no GPU slot) for n prompts as JSON, streamed for the
+        progress display. Returns (items, error text, notes)."""
+        v = self.valves
+        url = v.ollama_url.rstrip("/") + "/api/generate"
+        item_props: dict = {"prompt": {"type": "string"}}
+        required = ["prompt"]
+        if ar_options:
+            item_props["ar"] = {"type": "string", "enum": list(ar_options)}
+            required.append("ar")
+        schema = {
+            "type": "object",
+            "properties": {
+                "prompts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": item_props,
+                        "required": required,
+                    },
+                }
+            },
+            "required": ["prompts"],
+        }
+        parts = [f"Brief: {vorgabe}", f"Number of prompts: {n}"]
+        if words > 0:
+            parts.append(f"Each prompt should be about {words} words long.")
+        if fixed:
+            parts.append(f"Fixed requirements for every prompt: {fixed}")
+        if ar_options:
+            parts.append("Allowed aspect ratios: " + ", ".join(ar_options))
+        user_text = "\n".join(parts)
+
+        base = {
+            "model": v.series_model.strip(),
+            "stream": True,
+            "keep_alive": v.series_keep_alive,
+            "format": schema,
+        }
+        if v.series_num_ctx and v.series_num_ctx > 0:
+            base["options"] = {"num_ctx": int(v.series_num_ctx)}
+        # Same order as the translation: thinking off, then without the
+        # think field (models without thinking answer that with an error),
+        # then the instruction inside the prompt instead of the system role.
+        attempts = [
+            {**base, "prompt": user_text, "system": v.series_system, "think": False},
+            {**base, "prompt": user_text, "system": v.series_system},
+            {**base, "prompt": f"{v.series_system}\n\n{user_text}"},
+        ]
+        # No read timeout: without a slot the request waits in Alpaka's
+        # queue, and nothing arrives until it is dispatched. The stop
+        # button closes the connection.
+        timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=None)
+        last_err = None
+        truncated_text = (
+            "**Antwort abgeschnitten** – das Prompt-Modell hat vor dem Ende aufgehört. "
+            "Länge (`--words`) oder Anzahl verringern – oder die Admin-Valve "
+            "`series_num_ctx` erhöhen."
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for payload in attempts:
+                try:
+                    text, done_reason, finished, err = await self._series_stream(
+                        session, url, payload, emitter
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    last_err = f"{type(e).__name__}: {e}"
+                    continue
+                if err:
+                    last_err = err
+                    continue
+                if done_reason == "length":
+                    return None, truncated_text, []
+                text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+                items, notes, parse_err = self._series_parse_llm(text, n, ar_options)
+                if parse_err:
+                    if not finished:
+                        return None, truncated_text, []
+                    last_err = parse_err
+                    continue
+                return items, None, notes
+        return (
+            None,
+            f"**Prompt-Liste konnte nicht erzeugt werden** ({last_err}).\n\n"
+            f"Antwortet das Modell `{v.series_model.strip()}` unter `{v.ollama_url}`?",
+            [],
+        )
+
+    async def _series_stream(self, session, url: str, payload: dict, emitter):
+        """One streamed /api/generate call. Returns (text, done_reason,
+        finished, error). The status line shows a rough word count every
+        1.5 s (JSON keys count as words too - hence the '~')."""
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                detail = (await resp.text())[:300].strip()
+                return "", None, False, f"HTTP {resp.status} {detail}".strip()
+            chunks: list[str] = []
+            done_reason = None
+            finished = False
+            thinking = False
+            last_emit = 0.0
+            async for raw_line in resp.content:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("error"):
+                    return "".join(chunks), None, False, str(obj["error"])
+                piece = obj.get("response") or ""
+                if piece:
+                    chunks.append(piece)
+                if obj.get("thinking"):
+                    thinking = True
+                if obj.get("done"):
+                    finished = True
+                    done_reason = obj.get("done_reason")
+                    break
+                now = time.monotonic()
+                if now - last_emit >= 1.5:
+                    last_emit = now
+                    if chunks:
+                        count = len("".join(chunks).split())
+                        await self._emit(
+                            emitter,
+                            "Serie: Prompts werden erstellt ... ~"
+                            f"{count:,}".replace(",", ".") + " Wörter",
+                        )
+                    elif thinking:
+                        await self._emit(emitter, "Serie: Prompt-Modell denkt nach ...")
+            return "".join(chunks), done_reason, finished, None
+
+    @staticmethod
+    def _series_parse_llm(text: str, n: int, ar_options: Optional[list]):
+        """Turn the LLM's JSON into list items. Returns (items, notes, error)."""
+        data = None
+        try:
+            data = json.loads(text)
+        except Exception:
+            start, end = text.find("{"), text.rfind("}")
+            if 0 <= start < end:
+                try:
+                    data = json.loads(text[start : end + 1])
+                except Exception:
+                    data = None
+        if data is None:
+            return None, [], "kein gültiges JSON"
+        raw_items = data.get("prompts") if isinstance(data, dict) else data
+        if not isinstance(raw_items, list):
+            return None, [], "JSON ohne Liste 'prompts'"
+        items: list[dict] = []
+        bad_ar: list[int] = []
+        for entry in raw_items:
+            ar = None
+            if isinstance(entry, str):
+                text_value = entry
+            elif isinstance(entry, dict):
+                text_value = entry.get("prompt") or entry.get("text") or ""
+                ar = entry.get("ar")
+            else:
+                continue
+            text_value = " ".join(str(text_value).split())
+            text_value = re.sub(r"^\d+[.)]\s+", "", text_value)
+            if not text_value:
+                continue
+            if ar_options:
+                ar = str(ar or "").strip()
+                if ar not in ar_options:
+                    bad_ar.append(len(items) + 1)
+                    ar = None
+            else:
+                ar = None
+            items.append({"prompt": text_value, "ar": ar})
+        if not items:
+            return None, [], "keine Prompts in der Antwort"
+        notes: list[str] = []
+        if len(items) > n:
+            items = items[:n]
+            bad_ar = [b for b in bad_ar if b <= n]
+        elif len(items) < n:
+            notes.append(f"das Prompt-Modell hat nur {len(items)} von {n} Prompts geliefert")
+        if bad_ar:
+            notes.append(
+                "ungültiges Format bei Nr. "
+                + ", ".join(str(b) for b in bad_ar)
+                + " — dort gilt das Workflow-Format"
+            )
+        return items, notes, None
+
+    @staticmethod
+    def _series_parse_list(text: str):
+        """Read the visible (possibly edited) list: the lines after the
+        header of the form 'N. [ratio] text' or 'N. text'. Numbers are taken
+        from the text, not recounted. Returns (entries, notes)."""
+        lines = text.splitlines()
+        start = next(
+            (i for i, line in enumerate(lines) if line.lstrip().startswith(LIST_HEADER)),
+            None,
+        )
+        if start is None:
+            return [], []
+        entries: list[tuple] = []
+        seen: set = set()
+        dup: list[int] = []
+        collecting = False
+        for line in lines[start + 1 :]:
+            if not line.strip():
+                continue
+            m = LIST_LINE_RE.match(line)
+            if m:
+                collecting = True
+                num = int(m.group(1))
+                ratio = (m.group(2) or "").strip() or None
+                text_value = " ".join(m.group(3).split())
+                if num in seen:
+                    dup.append(num)
+                    continue
+                seen.add(num)
+                entries.append((num, text_value, ratio))
+            elif collecting:
+                break
+        notes = []
+        if dup:
+            notes.append(
+                "doppelte Nummer(n) in der Liste: "
+                + ", ".join(str(d) for d in dup)
+                + " — jeweils die erste gilt"
+            )
+        return entries, notes
+
+    @staticmethod
+    def _series_selection(value, numbers: list):
+        """--los 1,3,7 -> the chosen numbers in the given order."""
+        text = str(value or "").strip()
+        if not text:
+            return list(numbers), []
+        chosen: list[int] = []
+        notes: list[str] = []
+        bad, unknown, dup = [], [], []
+        for token in [t for t in re.split(r"[,;\s]+", text) if t]:
+            if not token.isdigit():
+                bad.append(token)
+                continue
+            k = int(token)
+            if k not in numbers:
+                unknown.append(k)
+            elif k in chosen:
+                dup.append(k)
+            else:
+                chosen.append(k)
+        if bad:
+            notes.append(
+                "nicht verstanden: "
+                + ", ".join(bad)
+                + " (nur Einzelnummern mit Komma, keine Bereiche)"
+            )
+        if unknown:
+            notes.append(
+                "nicht in der Liste: Nr. " + ", ".join(str(u) for u in unknown)
+            )
+        if dup:
+            notes.append("doppelt genannt: Nr. " + ", ".join(str(d) for d in dup))
+        return chosen, notes
+
+    async def _series_los_phase(self, ctx: dict, flags: dict):
+        """--los: find the latest list in the chat and render it (or a
+        selection of it)."""
+        hints = ctx["hints"]
+        messages = ctx["body"].get("messages") or []
+        list_index, list_text = None, ""
+        for i in range(len(messages) - 2, -1, -1):
+            msg = messages[i]
+            if msg.get("role") != "assistant":
+                continue
+            text = self._message_text(msg)
+            if any(line.lstrip().startswith(LIST_HEADER) for line in text.splitlines()):
+                list_index, list_text = i, text
+                break
+        if list_index is None:
+            return "Keine Prompt-Liste im Chat gefunden – zuerst `--serie` senden."
+        entries_all, parse_notes = self._series_parse_list(list_text)
+        hints.extend(parse_notes)
+        if not entries_all:
+            return (
+                "In der letzten Prompt-Liste stehen keine lesbaren Prompt-Zeilen "
+                "(Form: `1. [16:9] Text` bzw. `1. Text`, eine Zeile je Prompt)."
+            )
+        numbers = [e[0] for e in entries_all]
+        chosen, sel_notes = self._series_selection(flags.get("los", ""), numbers)
+        hints.extend(sel_notes)
+        if not chosen:
+            return "Keine der genannten Nummern steht in der Liste." + (
+                "\n\n*Hinweise: " + " · ".join(hints) + "*" if hints else ""
+            )
+        by_num = {e[0]: e for e in entries_all}
+        entries = [by_num[k] for k in chosen]
+
+        # The --serie message: the user message right before the list
+        serie_msg = None
+        for j in range(list_index - 1, -1, -1):
+            if messages[j].get("role") == "user":
+                serie_msg = messages[j]
+                break
+        serie_flags: dict = {}
+        if serie_msg is not None:
+            _p, serie_flags = self._parse_flags(
+                _strip_wrappers(self._message_text(serie_msg))
+            )
+        serie_layer = self._series_layer(serie_flags)
+        los_layer = self._series_layer(flags)
+        serie_layer.pop("words", None)
+        if "words" in los_layer:
+            los_layer.pop("words")
+            hints.append("`--words` wirkt nur beim Erzeugen der Liste")
+        eff = self._layer_flags(
+            self._layer_flags(ctx["defaults"], serie_layer), los_layer
+        )
+        ar_from_msg = any(
+            str(layer.get("ar", "")).strip() for layer in (serie_layer, los_layer)
+        )
+
+        # Input image: the one attached to --los wins, else the one from
+        # the --serie message (Open WebUI resends it as base64)
+        images_in = self._extract_images(ctx["body"])
+        if not images_in and serie_msg is not None:
+            images_in = self._images_from_message(serie_msg)
+
+        plan = await self._series_ar_plan(
+            ctx["h"], eff, ar_from_msg, ctx["user_valves"], images_in
+        )
+        hints.extend(plan["notes"])
+        return await self._series_prepare_render(
+            ctx, entries, eff, images_in, plan, None
+        )
+
+    def _series_item_ratio(self, plan: dict, line_ar: Optional[str], num: int, hints: list):
+        """(value for the workflow, display, source) of one list entry."""
+        if plan["mode"] == "fixed":
+            return plan["value_full"], plan["display"], plan["source"]
+        if plan["mode"] == "llm" and line_ar:
+            full = plan["short_to_full"].get(line_ar)
+            if full:
+                return full, line_ar, "LLM"
+            hints.append(f"Nr. {num}: Format [{line_ar}] unbekannt — Workflow-Format")
+        return "", "Workflow-Format", "Workflow"
+
+    async def _series_prepare_render(
+        self,
+        ctx: dict,
+        entries: list,
+        eff: dict,
+        images_in: list,
+        plan: dict,
+        list_block: Optional[str],
+    ):
+        """Shared preparation for --los and --nowait: apply every setting
+        that is the same for all images, upload the input image once, then
+        hand over to the rendering generator. Errors before the first image
+        come back as plain text."""
+        h, name, user_valves = ctx["h"], ctx["name"], ctx["user_valves"]
+        wf = ctx["wf"]
+        hints, info = ctx["hints"], ctx["info"]
+        used: list[str] = []
+        base = self.valves.comfy_url.rstrip("/")
+        prefix = (list_block + "\n\n") if list_block else ""
+
+        self._apply_negative(wf, h, eff, used)
+        file_markers = self._apply_static(wf, h, eff, user_valves, used)
+        unknown = [k for k in eff if k not in self._known_flags(h)]
+        if unknown:
+            used.append(
+                "unbekannt und ignoriert: " + ", ".join("--" + u for u in unknown)
+            )
+        used.append("ohne Übersetzung (Serienmodus)")
+
+        flags_prep = dict(eff)
+        flags_prep.pop("ar", None)  # the format comes from the series plan
+        try:
+            timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                flags_prep, _ar, err = await self._prepare_in_session(
+                    session,
+                    base,
+                    wf,
+                    h,
+                    flags_prep,
+                    user_valves,
+                    images_in,
+                    used,
+                    file_markers,
+                    name,
+                    ctx["emitter"],
+                    handle_ar=False,
+                )
+        except asyncio.TimeoutError:
+            err = "Zeitüberschreitung bei der Verbindung zu ComfyUI."
+        except aiohttp.ClientError as e:
+            err = f"Verbindung zu ComfyUI fehlgeschlagen: {e}"
+        if err:
+            return prefix + err
+
+        triggers = self._active_triggers(wf, h, flags_prep, used)
+        seed_fixed = user_valves.seed
+        if "seed" in eff and str(eff["seed"]).lstrip("-").isdigit():
+            seed_fixed = int(eff["seed"])
+        megapixels = self._megapixels(eff, user_valves)
+        if megapixels > 0:
+            used.append(f"{megapixels} MP")
+        if ctx["defaults"] and user_valves.show_prompt:
+            used.append(
+                "Vorgaben: "
+                + ", ".join(f"--{k} {v}".rstrip() for k, v in ctx["defaults"].items())
+            )
+
+        items = []
+        for num, text, line_ar in entries:
+            ratio, display, source = self._series_item_ratio(plan, line_ar, num, hints)
+            items.append(
+                {
+                    "num": num,
+                    "prompt": text,
+                    "ratio": ratio,
+                    "display": display,
+                    "source": source,
+                }
+            )
+
+        head = prefix
+        if hints:
+            head += "*Hinweise: " + " · ".join(hints) + "*\n\n"
+        render = {
+            "emitter": ctx["emitter"],
+            "user_id": ctx["user_id"],
+            "user_valves": user_valves,
+            "name": name,
+            "h": h,
+            "wf": wf,
+            "items": items,
+            "triggers": triggers,
+            "seed_fixed": seed_fixed,
+            "megapixels": megapixels,
+            "used": info + used,
+            "head": head,
+            "slot_tag": str(
+                ctx["metadata"].get("chat_id") or f"comfy-{random.randint(10000, 99999)}"
+            ),
+        }
+        return self._series_render(render)
+
+    async def _series_render(self, r: dict):
+        """The rendering generator: holds ONE GPU slot for the whole series,
+        renders the entries one after another and yields every result as
+        soon as it is there. Owns slot release and the closing status line
+        (pipe()'s finally has already run when this starts)."""
+        emitter = r["emitter"]
+        h = r["h"]
+        items = r["items"]
+        total = len(items)
+        user_valves = r["user_valves"]
+        base = self.valves.comfy_url.rstrip("/")
+        started = time.monotonic()
+        slot_id = None
+        hb_task = None
+        state = {"lost": False}
+        ok_count = 0
+        image_count = 0
+        failed: list[int] = []
+        finished = 0
+        streak = 0
+        end_reason = None
+        cancelled = False
+        abort_note = None
+        try:
+            if r["head"]:
+                yield r["head"]
+
+            if self.valves.use_alpaka_proxy:
+                slot_id, slot_err = await self._acquire_slot(
+                    emitter,
+                    f"{r['name']} (Serie {total})",
+                    r["slot_tag"],
+                    status_label="Serie",
+                )
+                if slot_err:
+                    end_reason = "kein GPU-Slot"
+                    yield self._slot_error_text(slot_err)
+                    return
+                hb_task = asyncio.create_task(self._heartbeat_loop(slot_id, state))
+
+            timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for i, item in enumerate(items, start=1):
+                    num = item["num"]
+                    wf_i = copy.deepcopy(r["wf"])
+                    final_prompt = item["prompt"]
+                    if r["triggers"]:
+                        final_prompt = (
+                            final_prompt.rstrip(" ,.") + ", " + ", ".join(r["triggers"])
+                        )
+                    self._set(wf_i, h["prompt"], final_prompt)
+                    seed = (
+                        r["seed_fixed"]
+                        if r["seed_fixed"] >= 0
+                        else random.randint(0, 2**53)
+                    )
+                    has_seed = self._set(wf_i, h.get("seed"), seed)
+                    self._apply_resolution(
+                        wf_i, h, item["ratio"], r["megapixels"], "", []
+                    )
+                    label = f"Serie: Nr. {num} ({i}/{total})"
+                    res = await self._render_job(
+                        session,
+                        base,
+                        wf_i,
+                        h,
+                        label,
+                        emitter,
+                        r["user_id"],
+                        fetch_status=f"{label} Bilder werden abgeholt ...",
+                    )
+                    finished = i
+                    head = f"**Nr. {num}** · {item['display']} · Bild {i}/{total}"
+                    if res["kind"] == "ok":
+                        ok_count += 1
+                        image_count += len(res["blocks"])
+                        streak = 0
+                        block = f"{head}\n\n{item['prompt']}\n\n" + "\n\n".join(
+                            res["blocks"]
+                        )
+                        if res["refined"]:
+                            block += f"\n\n**Verwendeter Prompt:** {res['refined']}"
+                        if user_valves.show_prompt:
+                            line = []
+                            if has_seed:
+                                line.append(f"Seed {seed}")
+                            line.append(f"Format {item['display']} ({item['source']})")
+                            line += res["notes"]
+                            block += "\n\n*" + " · ".join(line) + "*"
+                        yield block + "\n\n"
+                        continue
+
+                    failed.append(num)
+                    streak += 1
+                    block = (
+                        f"**Nr. {num}** · fehlgeschlagen – {res['short']} · "
+                        f"Bild {i}/{total}\n\n{item['prompt']}"
+                    )
+                    if res.get("detail"):
+                        block += f"\n\n```\n{res['detail']}\n```"
+                    yield block + "\n\n"
+                    if res["kind"] == "conn":
+                        end_reason = "ComfyUI nicht erreichbar"
+                        break
+                    if streak >= SERIES_FAIL_STREAK:
+                        end_reason = f"{SERIES_FAIL_STREAK} Fehlschläge in Folge"
+                        break
+
+            elapsed = _duration(time.monotonic() - started)
+            if image_count != ok_count:
+                done_text = (
+                    f"{ok_count} von {total} Prompts gerendert ({image_count} Bilder)"
+                )
+            else:
+                done_text = f"{ok_count} von {total} Bildern"
+            if end_reason:
+                summary = (
+                    f"**Serie abgebrochen** nach {finished}/{total} – {end_reason} · "
+                    f"{done_text} · {elapsed}"
+                )
+            else:
+                summary = f"**Serie fertig:** {done_text}"
+                if failed:
+                    summary += (
+                        f" · {len(failed)} fehlgeschlagen (Nr. "
+                        + ", ".join(str(f) for f in failed)
+                        + ")"
+                    )
+                summary += f" · {elapsed}"
+            used = list(r["used"])
+            if state.get("lost"):
+                used.append(
+                    "Hinweis: die GPU-Slot-Lease war zwischenzeitlich verfallen "
+                    "(Alpaka neu gestartet?) — die Serie lief trotzdem weiter"
+                )
+            out = "---\n\n" + summary
+            if user_valves.show_prompt and used:
+                out += "\n\n*" + " · ".join(used) + "*"
+            yield out
+        except asyncio.CancelledError as e:
+            cancelled = True
+            abort_note = getattr(e, "comfy_note", None)
+            raise
+        except GeneratorExit:
+            # The consumer went away (e.g. connection closed)
+            cancelled = True
+            raise
+        finally:
+            if hb_task is not None:
+                hb_task.cancel()
+            if slot_id:
+                # shield: the release must go through even on a second stop
+                await asyncio.shield(self._release_slot(slot_id))
+            if cancelled:
+                text = f"Abgebrochen nach {finished}/{total}"
+                if abort_note:
+                    text += f" — {abort_note}"
+            elif end_reason:
+                text = f"Serie abgebrochen nach {finished}/{total} — {end_reason}"
+            else:
+                text = (
+                    f"Serie fertig: {ok_count}/{total} in "
+                    f"{_duration(time.monotonic() - started)}"
+                )
+            await self._emit(emitter, text, done=True)
