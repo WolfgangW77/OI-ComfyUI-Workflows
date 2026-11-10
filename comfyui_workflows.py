@@ -1,12 +1,9 @@
 """
 title: OI-ComfyUI-Workflows
-author: Wolfgang Weber (WolfgangW77)
-version: 0.13.2
+author: Wolfgang Weber (WolfgangW77 on github)
+version: 0.13.3
 license: MIT
-description: Exposes every API-format workflow in a directory as its own
-model. Controlled via flags in the prompt (--ar, --no, --steps ...),
-optional translation of non-English prompts via Ollama. Serialises GPU
-access with the Alpaka Ollama Log Proxy (v5.3+) via a slot mechanism.
+description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
 requirements: aiohttp
 
 Written with AI assistance (Claude by Anthropic); reviewed and maintained
@@ -260,6 +257,40 @@ v0.13.2
   the mode to "custom" automatically, proxy-side). Handled
   pipe-locally like the other admin flags; the proxy persists changes
   in alpaka_settings.json.
+
+v0.13.3
+- A job that ends abnormally is now withdrawn from ComfyUI before the
+  GPU slot is released. Until now only the stop button did that: when
+  the compute cap (timeout_seconds) struck, or the connection to
+  ComfyUI broke while waiting for the result, the pipe returned, its
+  finally block released the slot - and ComfyUI kept rendering while
+  Alpaka already handed the GPU to the next chat. Both paths now call
+  the same clean-up as the stop button (_abort_job: pending -> deleted
+  from the queue, running -> /interrupt, only if it is our own
+  prompt_id) and append its result to the message. If the clean-up
+  fails as well (ComfyUI unreachable), the message says so and the
+  behaviour is as before. Errors before submission and after the
+  result has arrived need no clean-up and are unchanged.
+- Default of the admin valve ollama_url is now the Alpaka port
+  (http://host.docker.internal:11435), matching use_alpaka_proxy = on;
+  saved valve values are not affected. The valve description names
+  both cases (Alpaka or Ollama directly).
+- Stored and inline images carry the MIME type of their file name
+  (PNG, JPEG, WebP, GIF) instead of always image/png - relevant for
+  SaveAnimatedWEBP outputs.
+- Fix: --triggers 0/1 now works. It was documented in the manual and
+  accepted as a known flag, but never evaluated - matching trigger
+  words were always appended. Default stays on; --triggers 0 switches
+  them off for one message or as a saved default, a bare --triggers
+  resets as usual. The info line lists the suppressed trigger words.
+- The description in the header is a single line now. Open WebUI's
+  header parser reads "key: value" line by line, so only the first line
+  of the old multi-line description reached the function list. It now
+  also names the Alpaka versions (slot v5.3+, --handover v5.4+).
+- Small fixes: author line in the header per the publishing format,
+  admin manual ("Alle laufen pipe-lokal" - there are five clean-up
+  commands now; the run-time note names Alpaka's file-head constants
+  explicitly), dead statement removed from the --help builder.
 """
 
 import asyncio
@@ -394,6 +425,20 @@ def _clip_middle(text: str, limit: int = 2600) -> str:
     )
 
 
+_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _mime_for(filename: str) -> str:
+    """MIME type from the file name; unknown endings count as PNG. (v0.13.3)"""
+    return _MIME_BY_SUFFIX.get(Path(filename or "").suffix.lower(), "image/png")
+
+
 def _duration(seconds: float) -> str:
     """Make seconds readable: '8,4 s' or '2:05 min'."""
     if seconds < 60:
@@ -461,7 +506,8 @@ class Pipe:
         timeout_seconds: int = Field(
             default=900,
             description=(
-                "Rechen-Deckel ab Auftragsübermittlung; 0 = kein Deckel "
+                "Rechen-Deckel ab Auftragsübermittlung; bei Überschreitung "
+                "wird der Auftrag bei ComfyUI zurückgezogen. 0 = kein Deckel "
                 "(dann zählen nur Stopp-Knopf und die festen "
                 "Transport-Timeouts)."
             ),
@@ -486,8 +532,12 @@ class Pipe:
             ),
         )
         ollama_url: str = Field(
-            default="http://host.docker.internal:11434",
-            description="Ollama-Basis-URL für die Prompt-Übersetzung.",
+            default="http://host.docker.internal:11435",
+            description=(
+                "Basis-URL für die Prompt-Übersetzung: mit Alpaka die "
+                "Proxy-URL (Standard, Port 11435), ohne Alpaka Ollama direkt "
+                "(üblicherweise Port 11434)."
+            ),
         )
         proxy_url: str = Field(
             default="http://host.docker.internal:11435",
@@ -1286,7 +1336,7 @@ class Pipe:
                     path=path,
                     meta={
                         "name": safe,
-                        "content_type": "image/png",
+                        "content_type": _mime_for(safe),
                         "size": len(raw),
                     },
                 ),
@@ -1596,10 +1646,12 @@ class Pipe:
         return None
 
     async def _abort_job(self, base: str, prompt_id: str) -> str:
-        """After a stop in Open WebUI, withdraw our own job from ComfyUI. Runs
-        over its own short connection because the main session is being torn
-        down. Returns: a short text for the status line - no exception ever
-        escapes from here.
+        """Withdraw our own job from ComfyUI - after a stop in Open WebUI and,
+        since v0.13.3, after the compute cap or a broken connection while
+        waiting for the result (so the GPU slot is not released while
+        ComfyUI keeps rendering). Runs over its own short connection because
+        the main session is being torn down or broken. Returns: a short text
+        for the status line or message - no exception ever escapes from here.
 
         Assumption (documented ComfyUI behaviour, not verified against a
         running system): POST /queue {"delete": [id]} removes pending jobs,
@@ -1634,6 +1686,27 @@ class Pipe:
                 return "ComfyUI-Auftrag war schon fertig"
         except Exception as e:
             return f"Aufräumen bei ComfyUI fehlgeschlagen ({type(e).__name__}: {e})"
+
+    @staticmethod
+    def _abort_suffix(note: str) -> str:
+        """Turn an _abort_job result into a closing paragraph for the chat
+        message; a failed clean-up says that ComfyUI may still be rendering.
+        (v0.13.3)"""
+        if not note:
+            return ""
+        text = note[:1].upper() + note[1:]
+        if "fehlgeschlagen" in note:
+            text += " — der Auftrag läuft bei ComfyUI womöglich weiter"
+        return f"\n\n{text}."
+
+    async def _withdraw_open_job(self, base: str, prompt_id: Optional[str]) -> str:
+        """For the connection-error paths: withdraw a job that was accepted
+        but whose result never arrived; returns the closing paragraph or ""
+        if there is no such job. (v0.13.3)"""
+        if not prompt_id:
+            return ""
+        note = await asyncio.shield(self._abort_job(base, prompt_id))
+        return self._abort_suffix(note)
 
     def _set(self, wf: dict, handle, value):
         if not handle:
@@ -1760,8 +1833,8 @@ danach ggf. `--reset`.
 `proxy_url` (Alpaka-Basis-URL), `use_alpaka_proxy` (GPU-Slot vor jedem
 Bildauftrag; aus = Verhalten wie v0.12.4). Das automatische
 VRAM-Freiräumen wohnt seit v0.13.2 im Alpaka-Proxy (Saubere Übergabe) —
-zur Laufzeit schaltbar per `--handover`, die Dateikopf-Konstanten sind
-nur die Erststart-Vorgaben.
+zur Laufzeit schaltbar per `--handover`; Alpakas Dateikopf-Konstanten
+sind nur die Erststart-Vorgaben.
 
 ## Aufräum-Kommandos (nur Admins)
 
@@ -1773,7 +1846,7 @@ nur die Erststart-Vorgaben.
 | `--handover [on/off/custom]` | zeigt (ohne Wert) oder setzt Alpakas Saubere Übergabe |
 | `--handover-comfy 0/1`, `--handover-ollama 0/1` | Einzelschalter je Richtung (stellt automatisch auf custom) |
 
-Beide laufen pipe-lokal: kein GPU-Slot, keine Übersetzung, kein
+Alle laufen pipe-lokal: kein GPU-Slot, keine Übersetzung, kein
 ComfyUI-Auftrag — sie funktionieren also auch, wenn alle Chat-Modelle
 festhängen, und unabhängig von `use_alpaka_proxy`. Reihenfolge im
 Störfall: erst kill (räumt Rechnendes), dann unload (räumt VRAM —
@@ -1931,7 +2004,6 @@ in der Info-Zeile vermerkt.
                 "Einzelschalter --handover-comfy/--handover-ollama 0/1). "
                 "Alle laufen pipe-lokal — kein GPU-Slot, keine Übersetzung.",
             ]
-        lines += []
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -2407,6 +2479,13 @@ in der Info-Zeile vermerkt.
                 "unbekannt und ignoriert: " + ", ".join("--" + u for u in unknown)
             )
 
+        # v0.13.3: prompt_id of a job ComfyUI has accepted but whose result
+        # has not arrived yet - set right after submission, cleared once the
+        # history entry is there. The connection-error handlers at the end
+        # withdraw this job before returning, so pipe() does not release the
+        # GPU slot while ComfyUI keeps rendering.
+        open_job: Optional[str] = None
+
         try:
             # v0.13.1: transport timeouts only — they detect a dead
             # socket, they do not give up on a long render. The compute
@@ -2607,12 +2686,21 @@ in der Info-Zeile vermerkt.
                     used.append("ohne Übersetzung")
 
                 # --- Trigger words of the active LoRAs ---
+                # v0.13.3: --triggers 0 (message or saved default) switches
+                # them off; default on, as documented in the manual.
                 triggers = self._triggers_for(wf, h)
-                if triggers:
+                use_triggers = True
+                if "triggers" in flags:
+                    use_triggers = self._coerce(flags["triggers"], True)
+                if triggers and use_triggers:
                     final_prompt = (
                         final_prompt.rstrip(" ,.") + ", " + ", ".join(triggers)
                     )
                     used.append("Trigger: " + ", ".join(triggers))
+                elif triggers:
+                    used.append(
+                        "Trigger abgeschaltet (--triggers 0): " + ", ".join(triggers)
+                    )
 
                 self._set(wf, h["prompt"], final_prompt)
                 used.append(f"Prompt: {final_prompt}")
@@ -2698,6 +2786,7 @@ in der Info-Zeile vermerkt.
                             )
                         submitted = await resp.json()
                         prompt_id = submitted["prompt_id"]
+                        open_job = prompt_id  # v0.13.3: withdraw on connection loss
                         node_errors = submitted.get("node_errors") or {}
                         if node_errors and attempt == 1:
                             problems = []
@@ -2735,6 +2824,7 @@ in der Info-Zeile vermerkt.
                                 data = await resp.json()
                             if prompt_id in data:
                                 history = data[prompt_id]
+                                open_job = None  # result is there, nothing to withdraw
                                 break
                             position = await self._queue_position(
                                 session, base, prompt_id
@@ -2756,7 +2846,18 @@ in der Info-Zeile vermerkt.
                         raise
 
                     if history is None:
-                        return "Zeitüberschreitung: ComfyUI hat den Auftrag nicht abgeschlossen."
+                        # v0.13.3: compute cap reached - withdraw the job
+                        # (same clean-up as the stop button) BEFORE pipe()
+                        # releases the GPU slot. shield: completes even on
+                        # a stop during the clean-up.
+                        note = await asyncio.shield(self._abort_job(base, prompt_id))
+                        open_job = None
+                        return (
+                            "**Zeitüberschreitung:** ComfyUI hat den Auftrag nicht "
+                            f"innerhalb von {_duration(self.valves.timeout_seconds)} "
+                            "abgeschlossen (Admin-Valve `timeout_seconds`)."
+                            + self._abort_suffix(note)
+                        )
 
                     status = history.get("status", {})
                     if status.get("status_str") != "error":
@@ -2847,8 +2948,9 @@ in der Info-Zeile vermerkt.
                         blocks.append(f"![{img['filename']}]({url})")
                     else:
                         b64 = base64.b64encode(data).decode()
+                        mime = _mime_for(img["filename"])
                         blocks.append(
-                            f"![{img['filename']}](data:image/png;base64,{b64})"
+                            f"![{img['filename']}](data:{mime};base64,{b64})"
                         )
 
                 if store_error:
@@ -2878,6 +2980,10 @@ in der Info-Zeile vermerkt.
                 return out
 
         except asyncio.TimeoutError:
-            return "Zeitüberschreitung bei der Verbindung zu ComfyUI."
+            return "Zeitüberschreitung bei der Verbindung zu ComfyUI." + (
+                await self._withdraw_open_job(base, open_job)
+            )
         except aiohttp.ClientError as e:
-            return f"Verbindung zu ComfyUI fehlgeschlagen: {e}"
+            return f"Verbindung zu ComfyUI fehlgeschlagen: {e}" + (
+                await self._withdraw_open_job(base, open_job)
+            )
