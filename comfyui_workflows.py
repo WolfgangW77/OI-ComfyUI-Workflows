@@ -1,9 +1,9 @@
 """
 title: OI-ComfyUI-Workflows
 author: Wolfgang Weber (WolfgangW77 on github)
-version: 0.14.0
+version: 0.14.1
 license: MIT
-description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), image series from an LLM-written prompt list (--serie, --los), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
+description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), image series from an LLM-written prompt list (--serie, --los; the LLM sees the input image of image workflows), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
 requirements: aiohttp
 
 Written with AI assistance (Claude by Anthropic); reviewed and maintained
@@ -345,6 +345,43 @@ v0.14.0
 - Fix (--help, admin part): --handover-comfy 0/1 and --handover-ollama
   0/1 are now in backticks like every other command, so they can be
   copied with a click.
+
+v0.14.1
+- Format ban: every prompt-list request ends with "Do not mention aspect
+  ratio, image size or image format in the prompt text." - appended by
+  the pipe, not part of the valve texts, so it also reaches saved older
+  texts. (The live test showed "Aspect ratio 3:2." inside a prompt while
+  the format was fixed by the user valve.) A format chosen by the LLM
+  still goes into the JSON field "ar".
+- Format label in the short form above AND below every image:
+  "Format 1:1 (User-Valve)", "(--ar)", "(Vorgabe)", "(Bild-Input)",
+  "(LLM)", or "Format wie Workflow". Fixes "Format Workflow-Format
+  (Workflow)" and the nested brackets for the input image. The list
+  header keeps the long form.
+- "--serie N --los" works like "--serie N --nowait"; numbers after --los
+  are ignored there with a note (a selection only makes sense for an
+  existing list). Before, the combination was refused.
+- Image workflows: the input image now goes to the prompt LLM.
+  - Workflows with an image input need the image on the --serie message;
+    without it the pipe stops right away with the single-image message,
+    before any prompt is written (v0.14.0 wrote a list about nothing).
+  - Vision check first: POST /api/show via ollama_url; no "vision" in
+    capabilities -> clear message, no list; check not possible -> the
+    image goes anyway, with a note. Same timeouts as the prompt request.
+  - Images with a longest side above 1536 px are scaled down (JPEG 90,
+    EXIF orientation applied, large JPEGs decoded at reduced scale);
+    smaller ones go unchanged; without Pillow the original goes.
+  - --bildart edit|control (value flag, storable per workflow, default
+    edit) picks the instruction: new admin valves series_system_edit
+    (short edit instructions - the edit model sees the photo) and
+    series_system_control (describe the subject of the photo - structure
+    workflows like depth only see its shape). The list header names it
+    ("Bildart: edit") when an image went to the LLM. --bildart on a
+    workflow without image input is ignored with a note; on --los it has
+    no effect (note), on a single image it is noted in the info line.
+- --words and --bildart are checked in the shared validation stage
+  (_normalize), i.e. already when saved as defaults (principle since
+  v0.6.0): --words must be a number from 0, --bildart edit or control.
 """
 
 import asyncio
@@ -401,6 +438,46 @@ SERIES_FLAGS = {"serie", "nowait", "los"}  # commands, never stored as defaults
 SERIES_DEFAULT_COUNT = 10  # --serie without a number
 SERIES_WORDS_MAX = 500  # upper bound for --words / series_words
 SERIES_FAIL_STREAK = 3  # failed images in a row that end a series
+# v0.14.1: appended by the pipe to every list request (not part of the
+# valve texts, so it also reaches installations with older saved texts)
+SERIES_FORMAT_BAN = (
+    "Do not mention aspect ratio, image size or image format in the prompt text."
+)
+SERIES_IMAGE_MAX = 1536  # longest side of the image sent to the prompt LLM
+BILDART_VALUES = ("edit", "control")  # --bildart; first entry is the default
+DEFAULT_SERIES_SYSTEM_EDIT = (
+    "You write edit instructions for an image-editing model. An input image is "
+    "attached; the editing model sees this image and applies one instruction at a "
+    "time. You receive a brief, a number N and optionally a target length, fixed "
+    "requirements and a list of allowed aspect ratios. Look at the image carefully. "
+    "Write exactly N clearly different instructions that each fulfil the brief. Every "
+    "instruction says precisely what to change and what must stay the same (for "
+    "example: keep the subject, its pose and its identity unchanged), referring to "
+    "elements that are visible in the image. Write in English as plain imperative "
+    "sentences. No keyword lists, no weights, no quality tags. Never add trigger "
+    "words, LoRA names or anything starting with --. If a target length is given, keep "
+    "every instruction close to it. If fixed requirements are given, honour them in "
+    "every instruction. If allowed aspect ratios are given, pick for every instruction "
+    "the one that fits best. Reply only with the JSON object."
+)
+DEFAULT_SERIES_SYSTEM_CONTROL = (
+    "You write prompts for the text-to-image model Krea 2. It is guided by the "
+    "structure (depth or pose) of an attached input image but does not see its "
+    "colours, textures or details. You receive a brief, a number N and optionally a "
+    "target length, fixed requirements and a list of allowed aspect ratios. Look at "
+    "the image carefully. Write exactly N clearly different prompts that all fulfil "
+    "the brief. Every prompt describes the main subject of the image concretely - "
+    "species or type, colours, markings, clothing, distinctive features - so that it "
+    "stays recognisable, keeps its pose, and then applies the brief to setting, "
+    "season, lighting, style and mood. Write every prompt in English as natural "
+    "descriptive language: start with the overall style or medium, then the subject, "
+    "setting, lighting and mood. No keyword lists, no weights, no quality tags, no "
+    "negative prompts. Never add trigger words, LoRA names or anything starting with "
+    "--. If a target length is given, keep every prompt close to it. If fixed "
+    "requirements are given, honour them in every prompt. If allowed aspect ratios "
+    "are given, pick for every prompt the one that fits its composition best. Reply "
+    "only with the JSON object."
+)
 LIST_HEADER = "**Prompt-Serie**"  # first line of a prompt list in the chat
 # One list entry: "3. [16:9] text" or "3. text" (also "3)")
 LIST_LINE_RE = re.compile(r"^\s*(\d+)[.)]\s+(?:\[([^\]]*)\]\s*)?(.*\S)\s*$")
@@ -690,8 +767,23 @@ class Pipe:
         series_system: str = Field(
             default=DEFAULT_SERIES_SYSTEM,
             description=(
-                "Anweisung an das Prompt-Modell. Anzahl, Länge, feste Vorgaben und "
-                "erlaubte Formate hängt die Pipe selbst an."
+                "Anweisung an das Prompt-Modell (Workflows ohne Bildeingang). Anzahl, "
+                "Länge, Format-Verbot, feste Vorgaben und erlaubte Formate hängt die "
+                "Pipe selbst an."
+            ),
+        )
+        series_system_edit: str = Field(
+            default=DEFAULT_SERIES_SYSTEM_EDIT,
+            description=(
+                "Anweisung an das Prompt-Modell bei Workflows mit Bildeingang und "
+                "--bildart edit (Standard): kurze Änderungsanweisungen zum Foto."
+            ),
+        )
+        series_system_control: str = Field(
+            default=DEFAULT_SERIES_SYSTEM_CONTROL,
+            description=(
+                "Anweisung an das Prompt-Modell bei Workflows mit Bildeingang und "
+                "--bildart control: das Motiv aus dem Foto beschreiben, Vorgabe umsetzen."
             ),
         )
         series_max: int = Field(
@@ -1387,6 +1479,41 @@ class Pipe:
                             + ", ".join(o.split(" ")[0] for o in options)
                         )
                         out.pop("ar")
+
+        # --- Series values (v0.14.1): same check when saving and using ---
+        out, more = self._check_series_values(out)
+        notes += more
+        return out, notes
+
+    @staticmethod
+    def _check_series_values(values: dict):
+        """--words must be a number from 0, --bildart edit or control.
+        Invalid values are dropped with a note. Part of the shared
+        validation stage (saving defaults AND using them, see v0.6.0); also
+        called directly by the series list phase. (v0.14.1)"""
+        out = dict(values)
+        notes: list[str] = []
+        if "words" in out and str(out["words"]).strip():
+            text = str(out["words"]).strip()
+            try:
+                number = int(float(text.replace(",", ".")))
+            except ValueError:
+                number = -1
+            if number < 0:
+                out.pop("words")
+                notes.append(f"--words {text}: keine Zahl ab 0 — nicht übernommen")
+            else:
+                out["words"] = str(number)
+        if "bildart" in out and str(out["bildart"]).strip():
+            text = str(out["bildart"]).strip()
+            if text.lower() in BILDART_VALUES:
+                out["bildart"] = text.lower()
+            else:
+                out.pop("bildart")
+                notes.append(
+                    f"--bildart {text}: unbekannt — erlaubt: "
+                    + ", ".join(BILDART_VALUES)
+                )
         return out, notes
 
     async def _normalize_standalone(self, wf: dict, h: dict, values: dict):
@@ -1397,9 +1524,11 @@ class Pipe:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 return await self._normalize(session, base, wf, h, values)
         except Exception as e:
-            return dict(values), [
+            # v0.14.1: the series values need no ComfyUI - check them anyway
+            checked, more = self._check_series_values(values)
+            return checked, [
                 f"ComfyUI nicht erreichbar ({e}) — ungeprüft gespeichert"
-            ]
+            ] + more
 
     def _merge_lora_value(self, old: str, new: str) -> str:
         """Merge name and strength separately: whatever the new value does not
@@ -1584,6 +1713,7 @@ class Pipe:
             "nowait",
             "los",
             "words",
+            "bildart",  # v0.14.1
         }
         taken |= {f"lora{i}" for i in range(1, len(h["loras"]) + 1)}
         taken |= set(h["markers"])
@@ -1626,6 +1756,7 @@ class Pipe:
             "nowait",  # v0.14.0: image series
             "los",  # v0.14.0: image series
             "words",  # v0.14.0: image series (prompt length)
+            "bildart",  # v0.14.1: image series (edit/control)
         }
         known |= {f"lora{i}" for i in range(1, len(h["loras"]) + 1)}
         known |= set(h["markers"])
@@ -1933,8 +2064,9 @@ Bildprompts, danach werden sie nacheinander gerendert.
 
 | Kürzel | Wirkung |
 |---|---|
-| `--serie 5 --nowait` | Liste erzeugen und sofort rendern |
+| `--serie 5 --nowait` | Liste erzeugen und sofort rendern (`--serie 5 --los` wirkt genauso) |
 | `--words 200` | ungefähre Länge je Prompt in englischen Wörtern (0 = keine Vorgabe, höchstens 500) |
+| `--bildart edit` / `--bildart control` | nur Workflows mit Bildeingang: Änderungsanweisungen (Standard) bzw. Motivbeschreibung für Struktur-Workflows wie Depth -- am besten einmal pro Workflow als Vorgabe speichern |
 
 - **Format:** `--ar` gilt für alle Bilder. Ohne `--ar` gilt das Format
   des angehängten Bildes, dann `aspect_ratio` aus der Chat-Steuerung --
@@ -1946,6 +2078,10 @@ Bildprompts, danach werden sie nacheinander gerendert.
 - **Seed:** ein fester Seed gilt für alle Bilder der Serie, sonst bekommt
   jedes Bild einen neuen.
 - **Übersetzung** entfällt -- das Sprachmodell schreibt gleich englisch.
+- **Workflows mit Bildeingang:** das Foto gehört an die `--serie`-Nachricht
+  (sonst bricht die Pipe gleich ab) und geht verkleinert an das
+  Sprachmodell, das dafür Bilder verarbeiten können muss. `--los` nimmt
+  dasselbe Foto, ein neues Foto an `--los` ersetzt es.
 - Schlägt ein Bild fehl, geht es mit dem nächsten weiter; nach drei
   Fehlschlägen in Folge bricht die Serie ab. Der Stopp-Knopf beendet die
   Serie, fertige Bilder bleiben stehen.
@@ -2022,10 +2158,13 @@ zur Laufzeit schaltbar per `--handover`; Alpakas Dateikopf-Konstanten
 sind nur die Erststart-Vorgaben.
 
 Bildserien: `series_model` (Ollama-Modell für die Prompt-Liste; leer =
-Serienmodus aus), `series_keep_alive` (Standard `0`), `series_num_ctx`
-(0 = Einstellung von Ollama bzw. des Modells), `series_system`
-(Anweisung ans Prompt-Modell; Anzahl, Länge, feste Vorgaben und Formate
-hängt die Pipe selbst an), `series_max` (Obergrenze für `--serie N`,
+Serienmodus aus; für Workflows mit Bildeingang muss es Bilder verarbeiten
+können -- die Pipe prüft das über `/api/show`), `series_keep_alive`
+(Standard `0`), `series_num_ctx` (0 = Einstellung von Ollama bzw. des
+Modells), `series_system` (Anweisung ans Prompt-Modell ohne Bild),
+`series_system_edit` / `series_system_control` (Anweisungen mit Bild je
+nach `--bildart`; Anzahl, Länge, Format-Verbot, feste Vorgaben und
+Formate hängt die Pipe jeweils selbst an), `series_max` (Obergrenze für `--serie N`,
 zählt Prompts), `series_ar_options` (Formatauswahl für Workflows ohne
 ResolutionSelector). Die Prompt-Anfrage läuft ohne GPU-Slot als normale
 Anfrage über `ollama_url`; der Slot wird erst zum Rendern gezogen und
@@ -2182,7 +2321,14 @@ in der Info-Zeile vermerkt.
             "",
             "**Bildserien:** `Vorgabe --serie 10` lässt ein Sprachmodell eine Prompt-Liste "
             "schreiben (Länge je Prompt: `--words 200`), `--los` rendert sie, `--los 1,3,7` "
-            "nur die genannten Nummern, `--serie 5 --nowait` sofort. "
+            "nur die genannten Nummern, `--serie 5 --nowait` (oder `--serie 5 --los`) sofort. "
+            + (
+                "Bei diesem Workflow mit Bildeingang sieht das Sprachmodell das Foto; "
+                "`--bildart edit` (Standard) schreibt Änderungsanweisungen, "
+                "`--bildart control` beschreibt das Motiv für Struktur-Workflows. "
+                if h.get("image")
+                else ""
+            )
             + (
                 f"Prompt-Modell: {self.valves.series_model.strip()}."
                 if self.valves.series_model.strip()
@@ -2636,6 +2782,8 @@ in der Info-Zeile vermerkt.
         # v0.14.0: --words only steers the prompt list of a series
         if "words" in msg_flags:
             used.append("--words wirkt nur zusammen mit --serie")
+        if "bildart" in msg_flags:  # v0.14.1
+            used.append("--bildart wirkt nur zusammen mit --serie")
 
         # --- Report unknown flags instead of swallowing them silently ---
         unknown = [k for k in flags if k not in self._known_flags(h)]
@@ -2851,6 +2999,17 @@ in der Info-Zeile vermerkt.
         )
 
     @staticmethod
+    def _needs_image_text(name: str) -> str:
+        """Message for a workflow with image input but no image attached
+        (single image since v0.7.x; series list phase since v0.14.1)."""
+        return (
+            f"**{name}** ist ein Bearbeitungs-Workflow und braucht ein Bild.\n\n"
+            "Häng ein Foto an die Nachricht an (Plus-Symbol neben dem "
+            "Eingabefeld) und schreib dazu, was geändert werden soll — "
+            "zum Beispiel „schönes Wetter“."
+        )
+
+    @staticmethod
     def _no_output_text(name: str) -> str:
         return (
             f"**{name}** enthält keinen Bild-Ausgabeknoten (SaveImage oder "
@@ -2977,14 +3136,7 @@ in der Info-Zeile vermerkt.
                         "dieser Workflow nimmt nur eins"
                     )
             else:
-                return (
-                    flags,
-                    "",
-                    f"**{name}** ist ein Bearbeitungs-Workflow und braucht ein Bild.\n\n"
-                    "Häng ein Foto an die Nachricht an (Plus-Symbol neben dem "
-                    "Eingabefeld) und schreib dazu, was geändert werden soll — "
-                    "zum Beispiel „schönes Wetter“.",
-                )
+                return flags, "", self._needs_image_text(name)
         elif images_in:
             used.append(
                 "Bild angehängt, aber dieser Workflow verarbeitet keins "
@@ -3380,11 +3532,18 @@ in der Info-Zeile vermerkt.
     ):
         """Dispatch --serie (list phase, optionally rendering right away
         with --nowait) and --los (render a list from the chat)."""
+        hints: list[str] = []
         if "serie" in flags and "los" in flags:
-            return (
-                "`--serie` und `--los` bitte nicht in derselben Nachricht verwenden — "
-                "erst die Liste erzeugen, dann mit `--los` starten."
-            )
+            # v0.14.1: --los next to --serie means "render right away",
+            # like --nowait; a selection makes no sense for a new list
+            flags = dict(flags)
+            selection = str(flags.pop("los") or "").strip()
+            flags["nowait"] = ""
+            if selection:
+                hints.append(
+                    f"`--los {selection}`: Auswahl gilt nur für eine bestehende Liste "
+                    "— hier wirkt `--los` wie `--nowait`"
+                )
         if "nowait" in flags and "serie" not in flags:
             return (
                 "`--nowait` gehört zu `--serie`, zum Beispiel:\n\n"
@@ -3407,7 +3566,7 @@ in der Info-Zeile vermerkt.
             "name": name,
             "h": h,
             "defaults": self._load_defaults(user.get("id"), pipe_id),
-            "hints": [],
+            "hints": hints,
             "info": [],
         }
         if "serie" in flags:
@@ -3528,12 +3687,15 @@ in der Info-Zeile vermerkt.
             h.get("dimension_nodes") and not h.get("resolution")
         )
 
-        def fixed(value_full: str, display: str, source: str) -> dict:
+        def fixed(value_full: str, display: str, source: str, short: str) -> dict:
+            # source: long form for the list header; short (v0.14.1): the
+            # label in "Format 1:1 (User-Valve)" above and below the images
             return {
                 "mode": "fixed",
                 "value_full": value_full,
                 "display": display,
                 "source": source,
+                "short": short,
                 "short_to_full": short_to_full,
                 "notes": notes,
             }
@@ -3543,6 +3705,7 @@ in der Info-Zeile vermerkt.
             "value_full": "",
             "display": "",
             "source": "",
+            "short": "",
             "short_to_full": short_to_full,
             "notes": notes,
         }
@@ -3558,6 +3721,7 @@ in der Info-Zeile vermerkt.
                     full,
                     full.split(" ")[0],
                     "--ar" if ar_from_msg else "gespeicherte Vorgabe",
+                    "--ar" if ar_from_msg else "Vorgabe",
                 )
             notes.append(f"`--ar {ar}`: Format unbekannt — ignoriert")
 
@@ -3579,17 +3743,19 @@ in der Info-Zeile vermerkt.
                         else None
                     )
                     if chosen:
-                        return fixed(chosen, chosen.split(" ")[0], source)
+                        return fixed(chosen, chosen.split(" ")[0], source, "Bild-Input")
                 else:
                     g = math.gcd(w, hh) or 1
-                    return fixed(f"{w}:{hh}", f"{w // g}:{hh // g}", source)
+                    return fixed(
+                        f"{w}:{hh}", f"{w // g}:{hh // g}", source, "Bild-Input"
+                    )
 
         # 3. user valve
         uv = str(user_valves.aspect_ratio or "").strip()
         if uv:
             full = self._series_match_ar(uv, h, options_full)
             if full:
-                return fixed(full, full.split(" ")[0], "User-Valve")
+                return fixed(full, full.split(" ")[0], "User-Valve", "User-Valve")
             notes.append(f"User-Valve `aspect_ratio` {uv}: Format unbekannt — ignoriert")
 
         # 4. the LLM chooses per prompt
@@ -3599,6 +3765,7 @@ in der Info-Zeile vermerkt.
                 "value_full": "",
                 "display": "",
                 "source": "LLM",
+                "short": "LLM",
                 "short_to_full": short_to_full,
                 "notes": notes,
             }
@@ -3618,7 +3785,9 @@ in der Info-Zeile vermerkt.
         v = self.valves
         hints, info = ctx["hints"], ctx["info"]
         user_valves = ctx["user_valves"]
-        if not v.series_model.strip():
+        h = ctx["h"]
+        model = v.series_model.strip()
+        if not model:
             return (
                 "**Serienmodus nicht verfügbar:** in den Admin-Valves ist kein "
                 "`series_model` gesetzt."
@@ -3629,12 +3798,26 @@ in der Info-Zeile vermerkt.
                 "Für eine Serie fehlt die Vorgabe. Der Text steht **vor** den Kürzeln, "
                 "zum Beispiel:\n\n`Katze in vier Jahreszeiten, Fotostil --serie 10`"
             )
+        images_in = self._extract_images(ctx["body"])
+        # v0.14.1: a workflow with image input needs its image before any
+        # prompt is written - otherwise the LLM writes about nothing
+        if h.get("image") and not images_in:
+            return self._needs_image_text(ctx["name"])
+
         n = self._series_count(flags.get("serie", ""), hints)
         nowait = "nowait" in flags
         layer = self._series_layer(flags)
         eff = self._layer_flags(ctx["defaults"], layer)
+        eff, checks = self._check_series_values(eff)
+        hints.extend(checks)
         words = self._series_words(eff, user_valves, hints)
         eff.pop("words", None)
+        bildart = eff.pop("bildart", None)
+        if bildart and not h.get("image"):
+            hints.append(
+                "`--bildart` wird ignoriert — dieser Workflow hat keinen Bildeingang"
+            )
+            bildart = None
 
         system_prompt, had_memory, had_summary = self._system_prompt(ctx["body"])
         if had_memory:
@@ -3646,9 +3829,8 @@ in der Info-Zeile vermerkt.
         if system_prompt:
             info.append("Systemprompt als feste Vorgabe an das Prompt-Modell übergeben")
 
-        images_in = self._extract_images(ctx["body"])
         plan = await self._series_ar_plan(
-            ctx["h"],
+            h,
             eff,
             bool(str(layer.get("ar", "")).strip()),
             user_valves,
@@ -3657,17 +3839,59 @@ in der Info-Zeile vermerkt.
         hints.extend(plan["notes"])
         ar_options = list(plan["short_to_full"]) if plan["mode"] == "llm" else None
 
+        # --- Image for the prompt LLM (v0.14.1) ---
+        system_text = v.series_system
+        llm_image = None
+        used_bildart = None
+        if h.get("image"):
+            used_bildart = bildart or BILDART_VALUES[0]
+            system_text = (
+                v.series_system_control
+                if used_bildart == "control"
+                else v.series_system_edit
+            )
+            await self._emit(
+                ctx["emitter"], "Serie: Bildfähigkeit des Prompt-Modells wird geprüft ..."
+            )
+            vision, detail = await self._series_vision_check()
+            if vision is False:
+                return (
+                    f"**Das Prompt-Modell `{model}` kann keine Bilder verarbeiten.**\n\n"
+                    "Für Serien mit einem Bild-Workflow in der Admin-Valve "
+                    "`series_model` ein Modell mit Bildverarbeitung eintragen."
+                )
+            if vision is None:
+                hints.append(
+                    f"Bildfähigkeit von `{model}` nicht prüfbar ({detail}) — "
+                    "das Bild geht trotzdem mit"
+                )
+            llm_image, image_note = self._series_llm_image(images_in[0][0])
+            if image_note:
+                info.append(image_note)
+        elif images_in:
+            info.append(
+                "Bild angehängt, aber dieser Workflow hat keinen Bildeingang — "
+                "es geht nicht an das Prompt-Modell"
+            )
+
         await self._emit(ctx["emitter"], "Serie: Prompts werden erstellt ...")
         items, err, gen_notes = await self._series_generate(
-            ctx["emitter"], vorgabe, n, words, system_prompt, ar_options
+            ctx["emitter"],
+            vorgabe,
+            n,
+            words,
+            system_prompt,
+            ar_options,
+            system_text,
+            llm_image,
         )
         if err:
             return err
         hints.extend(gen_notes)
-        info.append(f"Prompt-Modell: {v.series_model.strip()}")
+        info.append(f"Prompt-Modell: {model}")
 
         list_block = self._series_list_block(
-            ctx["name"], items, plan, words, vorgabe, nowait
+            ctx["name"], items, plan, words, vorgabe, nowait, used_bildart
         )
         if not nowait:
             out = list_block
@@ -3684,6 +3908,70 @@ in der Info-Zeile vermerkt.
             ctx, entries, eff, images_in, plan, list_block
         )
 
+    async def _series_vision_check(self):
+        """Ask Ollama (via ollama_url, i.e. through Alpaka) whether
+        series_model can process images. Returns (True|False|None, detail);
+        None = could not be checked. No read timeout, like the prompt
+        request itself. (v0.14.1)"""
+        url = self.valves.ollama_url.rstrip("/") + "/api/show"
+        timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=None)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    url, json={"model": self.valves.series_model.strip()}
+                ) as resp:
+                    if resp.status != 200:
+                        return None, f"HTTP {resp.status}"
+                    data = await resp.json(content_type=None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+        caps = data.get("capabilities") if isinstance(data, dict) else None
+        if not isinstance(caps, list):
+            return None, "keine Angabe zu capabilities"
+        return "vision" in caps, None
+
+    @staticmethod
+    def _series_llm_image(raw: bytes):
+        """The input image as base64 for the prompt LLM. Images whose
+        longest side exceeds SERIES_IMAGE_MAX are scaled down and sent as
+        JPEG (quality 90) with the EXIF orientation applied; smaller ones go
+        unchanged; without Pillow the original goes. Returns (b64, note).
+        (v0.14.1)"""
+        try:
+            import io as _io
+
+            from PIL import Image as _Image
+            from PIL import ImageOps as _ImageOps
+        except Exception:
+            return (
+                base64.b64encode(raw).decode(),
+                "Bild unverkleinert an das Prompt-Modell (Pillow fehlt)",
+            )
+        try:
+            with _Image.open(_io.BytesIO(raw)) as original:
+                w, hh = original.size
+                if max(w, hh) <= SERIES_IMAGE_MAX:
+                    return base64.b64encode(raw).decode(), None
+                if original.format == "JPEG":
+                    # decode at a reduced scale - cheap even for 200 MP photos
+                    original.draft("RGB", (SERIES_IMAGE_MAX, SERIES_IMAGE_MAX))
+                im = _ImageOps.exif_transpose(original).convert("RGB")
+                im.thumbnail((SERIES_IMAGE_MAX, SERIES_IMAGE_MAX), _Image.LANCZOS)
+                buf = _io.BytesIO()
+                im.save(buf, format="JPEG", quality=90)
+                return (
+                    base64.b64encode(buf.getvalue()).decode(),
+                    f"Bild für das Prompt-Modell verkleinert ({w}x{hh} → "
+                    f"{im.size[0]}x{im.size[1]})",
+                )
+        except Exception as e:
+            return (
+                base64.b64encode(raw).decode(),
+                f"Bild unverkleinert an das Prompt-Modell ({type(e).__name__})",
+            )
+
     def _series_list_block(
         self,
         name: str,
@@ -3692,6 +3980,7 @@ in der Info-Zeile vermerkt.
         words: int,
         vorgabe: str,
         nowait: bool,
+        bildart: Optional[str] = None,
     ) -> str:
         avg = round(sum(len(it["prompt"].split()) for it in items) / len(items))
         length = (
@@ -3701,6 +3990,8 @@ in der Info-Zeile vermerkt.
             f"{LIST_HEADER} · {name} · {len(items)} Prompts · "
             f"{self._series_format_header(plan)} · {length}"
         )
+        if bildart:  # v0.14.1: only when an image went to the prompt LLM
+            head += f" · Bildart: {bildart}"
         lines = [head, "", f"Vorgabe: {vorgabe}", ""]
         for i, it in enumerate(items, start=1):
             tag = f"[{it['ar']}] " if plan["mode"] == "llm" and it.get("ar") else ""
@@ -3726,10 +4017,15 @@ in der Info-Zeile vermerkt.
         words: int,
         fixed: str,
         ar_options: Optional[list],
+        system_text: Optional[str] = None,
+        image_b64: Optional[str] = None,
     ):
         """Ask the prompt LLM (via ollama_url, i.e. through Alpaka's normal
         queue - no GPU slot) for n prompts as JSON, streamed for the
-        progress display. Returns (items, error text, notes)."""
+        progress display. Returns (items, error text, notes).
+        v0.14.1: system_text (series_system or the edit/control text for
+        image workflows), image_b64 (input image for the LLM) and the
+        format ban appended to every request."""
         v = self.valves
         url = v.ollama_url.rstrip("/") + "/api/generate"
         item_props: dict = {"prompt": {"type": "string"}}
@@ -3754,27 +4050,31 @@ in der Info-Zeile vermerkt.
         parts = [f"Brief: {vorgabe}", f"Number of prompts: {n}"]
         if words > 0:
             parts.append(f"Each prompt should be about {words} words long.")
+        parts.append(SERIES_FORMAT_BAN)
         if fixed:
             parts.append(f"Fixed requirements for every prompt: {fixed}")
         if ar_options:
             parts.append("Allowed aspect ratios: " + ", ".join(ar_options))
         user_text = "\n".join(parts)
 
+        system_text = system_text or v.series_system
         base = {
             "model": v.series_model.strip(),
             "stream": True,
             "keep_alive": v.series_keep_alive,
             "format": schema,
         }
+        if image_b64:
+            base["images"] = [image_b64]
         if v.series_num_ctx and v.series_num_ctx > 0:
             base["options"] = {"num_ctx": int(v.series_num_ctx)}
         # Same order as the translation: thinking off, then without the
         # think field (models without thinking answer that with an error),
         # then the instruction inside the prompt instead of the system role.
         attempts = [
-            {**base, "prompt": user_text, "system": v.series_system, "think": False},
-            {**base, "prompt": user_text, "system": v.series_system},
-            {**base, "prompt": f"{v.series_system}\n\n{user_text}"},
+            {**base, "prompt": user_text, "system": system_text, "think": False},
+            {**base, "prompt": user_text, "system": system_text},
+            {**base, "prompt": f"{system_text}\n\n{user_text}"},
         ]
         # No read timeout: without a slot the request waits in Alpaka's
         # queue, and nothing arrives until it is dispatched. The stop
@@ -4042,9 +4342,13 @@ in der Info-Zeile vermerkt.
         serie_layer = self._series_layer(serie_flags)
         los_layer = self._series_layer(flags)
         serie_layer.pop("words", None)
+        serie_layer.pop("bildart", None)
         if "words" in los_layer:
             los_layer.pop("words")
             hints.append("`--words` wirkt nur beim Erzeugen der Liste")
+        if "bildart" in los_layer:  # v0.14.1
+            los_layer.pop("bildart")
+            hints.append("`--bildart` wirkt nur beim Erzeugen der Liste")
         eff = self._layer_flags(
             self._layer_flags(ctx["defaults"], serie_layer), los_layer
         )
@@ -4067,15 +4371,17 @@ in der Info-Zeile vermerkt.
         )
 
     def _series_item_ratio(self, plan: dict, line_ar: Optional[str], num: int, hints: list):
-        """(value for the workflow, display, source) of one list entry."""
+        """(value for the workflow, label) of one list entry. The label is
+        the short form shown above and below the image (v0.14.1):
+        "Format 1:1 (User-Valve)", "Format 16:9 (LLM)", "Format wie Workflow"."""
         if plan["mode"] == "fixed":
-            return plan["value_full"], plan["display"], plan["source"]
+            return plan["value_full"], f"Format {plan['display']} ({plan['short']})"
         if plan["mode"] == "llm" and line_ar:
             full = plan["short_to_full"].get(line_ar)
             if full:
-                return full, line_ar, "LLM"
-            hints.append(f"Nr. {num}: Format [{line_ar}] unbekannt — Workflow-Format")
-        return "", "Workflow-Format", "Workflow"
+                return full, f"Format {line_ar} (LLM)"
+            hints.append(f"Nr. {num}: Format [{line_ar}] unbekannt — Format wie Workflow")
+        return "", "Format wie Workflow"
 
     async def _series_prepare_render(
         self,
@@ -4147,16 +4453,8 @@ in der Info-Zeile vermerkt.
 
         items = []
         for num, text, line_ar in entries:
-            ratio, display, source = self._series_item_ratio(plan, line_ar, num, hints)
-            items.append(
-                {
-                    "num": num,
-                    "prompt": text,
-                    "ratio": ratio,
-                    "display": display,
-                    "source": source,
-                }
-            )
+            ratio, label = self._series_item_ratio(plan, line_ar, num, hints)
+            items.append({"num": num, "prompt": text, "ratio": ratio, "label": label})
 
         head = prefix
         if hints:
@@ -4252,7 +4550,7 @@ in der Info-Zeile vermerkt.
                         fetch_status=f"{label} Bilder werden abgeholt ...",
                     )
                     finished = i
-                    head = f"**Nr. {num}** · {item['display']} · Bild {i}/{total}"
+                    head = f"**Nr. {num}** · {item['label']} · Bild {i}/{total}"
                     if res["kind"] == "ok":
                         ok_count += 1
                         image_count += len(res["blocks"])
@@ -4266,7 +4564,7 @@ in der Info-Zeile vermerkt.
                             line = []
                             if has_seed:
                                 line.append(f"Seed {seed}")
-                            line.append(f"Format {item['display']} ({item['source']})")
+                            line.append(item["label"])
                             line += res["notes"]
                             block += "\n\n*" + " · ".join(line) + "*"
                         yield block + "\n\n"

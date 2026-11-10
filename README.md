@@ -11,15 +11,18 @@ A tabby cat chasing a butterfly in a meadow --ar 16:9 --batch 2 --seed 42
 Built for a small self-hosted setup (Open WebUI + ComfyUI + Ollama on the same
 box), including non-technical family members as users. That shaped a lot of the
 design: strict validation instead of silent failure, defaults that survive
-across chats, and a manual reachable from inside the chat. Optionally the pipe
-shares the GPU with chat models through the
+across chats, and a manual reachable from inside the chat. A local LLM can
+write whole series of prompts that are then rendered one after another.
+Optionally the pipe shares the GPU with chat models through the
 [Alpaka Ollama Log Proxy](https://github.com/WolfgangW77/Alpaka-Ollama-Log-Proxy).
 
 > **Language note:** the code, comments and this README are English. The
 > **user-facing texts** (help output, in-chat manual, status and error
 > messages, valve descriptions) are **German**, because that is what the
 > people using this instance speak. They are plain strings in the source and
-> easy to translate if you need another language.
+> easy to translate if you need another language. The instructions for the
+> prompt LLM of the image series (valves `series_system*`) are English, like
+> the prompts it writes.
 
 ## Features
 
@@ -51,6 +54,10 @@ shares the GPU with chat models through the
   and rejected in the other.
 - **Optional prompt translation** via a local Ollama model, with quoted text
   protected from translation (useful for lettering in the image).
+- **Image series.** `brief --serie 10` lets a local LLM write ten English
+  image prompts as an editable list in the chat; `--los` renders them one
+  after another, each image appearing as soon as it is done. For image
+  workflows the LLM sees the input photo. See [Image series](#image-series).
 - **Image editing workflows.** Attach an image; if the workflow has an image
   input (`PIPE_IMAGE` or a `LoadImage` node), the image alone is enough – no
   prompt required.
@@ -75,7 +82,8 @@ shares the GPU with chat models through the
   timeout, stop) and kept alive by a heartbeat; the slot holder's own
   translation requests are let through immediately. Uploads and option
   queries run before the slot is taken, and waiting for the slot does not
-  count against `timeout_seconds`.
+  count against `timeout_seconds`. An image series holds one slot for all
+  of its images; writing the prompt list needs no slot.
 - **Jobs are withdrawn, not orphaned.** The stop button, the compute cap
   (`timeout_seconds`) and a lost connection while waiting for the result all
   withdraw the job from ComfyUI before the GPU slot is released: pending jobs
@@ -106,8 +114,10 @@ shares the GPU with chat models through the
   installs it). Pillow is used for reading image dimensions if present
   (it ships with Open WebUI); without it a small built-in header parser
   covers PNG, JPEG and WebP.
-- Optional: Ollama for prompt translation; the `ResolutionSelector` custom
-  node if you want `--ar` with named presets
+- Optional: Ollama for prompt translation and for the image series (any
+  recent version with JSON-schema `format` support; for image workflows the
+  series model must be able to process images); the `ResolutionSelector`
+  custom node if you want `--ar` with named presets
 - Optional: the [Alpaka Ollama Log Proxy](https://github.com/WolfgangW77/Alpaka-Ollama-Log-Proxy)
   for GPU sharing – v5.3+ for the slot, v5.4+ for `--handover`.
   **`use_alpaka_proxy` is on by default:** without Alpaka, switch it off,
@@ -121,7 +131,8 @@ shares the GPU with chat models through the
    `/app/backend/data/comfy_workflows`
 3. Set the **Valves** (gear icon on the function), at least `comfy_url`.
    Without Alpaka: switch `use_alpaka_proxy` off and, if you want
-   translation, point `ollama_url` at Ollama directly (usually port 11434).
+   translation or image series, point `ollama_url` at Ollama directly
+   (usually port 11434). For image series set `series_model`.
 4. Export a workflow from ComfyUI and drop it into the directory (see below).
 5. Pick the new model in a chat and send `--help`.
 
@@ -167,6 +178,8 @@ LoRA slot numbers can shift, and stale defaults may need a `--reset`.
 | `--loras`, `--vaes`, `--ars`, … | List options; add a search term to filter |
 | `--reset` | Delete all saved defaults for this workflow |
 | `--arauto 0/1` | Aspect ratio from the attached image off/on (image workflows only) |
+| `brief --serie 10` | Let the prompt LLM write a list of 10 prompts (see [Image series](#image-series)) |
+| `--los`, `--los 1,3,7` | Render the latest prompt list in the chat, or a selection of it |
 | flags only, no prompt | Save these flags as defaults |
 | `--flag` without value | Reset that one entry (permanently when saving, once when rendering) |
 
@@ -196,6 +209,91 @@ Order in an emergency: first kill (stops what is computing), then unload
 (frees VRAM on the Ollama and/or ComfyUI side). Handover changes are
 persisted by Alpaka; no proxy restart needed.
 
+## Image series
+
+A local LLM turns a brief into a list of image prompts; the pipe then
+renders them one after another with the selected workflow. Works with every
+workflow model.
+
+```
+A cat in the four seasons, photo style --serie 10
+```
+
+1. **Write the list.** `--serie N` (default 10, at most `series_max`) asks
+   `series_model` via `ollama_url` for N English prompts. The answer is
+   streamed and the status line counts the words as they arrive. The list
+   shows up as a numbered list with a header:
+
+   ```
+   **Prompt-Serie** · Krea2 · 10 Prompts · Format: je Prompt vom LLM gewählt · Länge: ~60 Wörter (Ø 57)
+
+   Vorgabe: A cat in the four seasons, photo style
+
+   1. [16:9] Photo of a black British shorthair cat in fresh spring grass ...
+   2. [3:2] ...
+   ```
+
+2. **Check and edit.** Open WebUI's edit function works on the list – the
+   pipe reads the visible text back from the chat history, so the edited
+   version is what gets rendered. One line per prompt, `N. [ratio] text` or
+   `N. text`.
+3. **Render.** `--los` renders the whole list, `--los 1,3,7` the given
+   numbers. `--serie N --nowait` (or `--serie N --los`) writes the list and
+   renders right away; a later `--los 4` re-renders a single entry.
+
+**Rendering.** One GPU slot for the whole series. Each image appears as soon
+as it is done, with its prompt and the format above it
+(`**Nr. 3** · Format 16:9 (LLM) · Bild 2/3`). A failed image is reported and
+the series continues; three failures in a row or ComfyUI being unreachable
+end it. The stop button ends the series and withdraws the running job;
+finished images stay.
+
+**The list request** runs without a GPU slot as a normal request through
+Alpaka, asks for JSON with a schema (`format`), falls back like the
+translation for models with or without thinking, and has no read timeout
+(it may wait in Alpaka's queue; the stop button cancels it). A cut-off
+answer (`done_reason` "length" or incomplete JSON) is reported – lower the
+count or the length, or raise `series_num_ctx`.
+
+**Length.** `--words N` or the user valve `series_words` (default 60,
+`0` = no target, at most 500) sets the approximate length per prompt in
+English words. The header shows target and achieved average.
+
+**Format.** First match wins: `--ar` (message or saved default) → input
+image → `aspect_ratio` user valve → the LLM picks one per prompt (from the
+`ResolutionSelector` entries, or `series_ar_options` for plain width/height
+workflows) → workflow file. A fixed format is named once in the header
+(`Format: 1:1, fixiert über User-Valve`) and the LLM is not asked. Every
+request tells the LLM not to put formats into the prompt text. Above and
+below each image the format appears in short form: `Format 1:1 (User-Valve)`,
+`(--ar)`, `(Vorgabe)`, `(Bild-Input)`, `(LLM)` or `Format wie Workflow`.
+
+**All other flags** (`--lora1`, `--seed`, `--batch`, markers …) are taken
+1:1 for every image. Flags on the `--los` message override those of the
+`--serie` message, which override saved defaults. A fixed seed applies to
+every image of the series, otherwise each image gets a new one. `--batch`
+applies per prompt. There is no translation step – the LLM writes English.
+The system prompt of a workspace model goes to the LLM as fixed
+requirements for every prompt.
+
+**Image workflows** (with `PIPE_IMAGE` / `LoadImage`):
+
+- The photo belongs on the `--serie` message; without it the pipe stops
+  right away, before any prompt is written.
+- The pipe first checks via Ollama's `/api/show` whether `series_model`
+  can process images. If not, it says so and writes no list; if the check
+  itself fails, the image goes anyway with a note.
+- Photos larger than 1536 px on the long side are scaled down (JPEG,
+  EXIF orientation applied) before they go to the LLM.
+- `--bildart edit` (default) asks for short edit instructions – for
+  workflows where the image model sees the photo. `--bildart control` asks
+  the LLM to describe the subject of the photo concretely – for structure
+  workflows like depth control, where the image model only sees the shape.
+  Save it once per workflow as a default (`--bildart control`). The header
+  names the mode (`Bildart: control`).
+- `--los` reuses the photo of the `--serie` message; a photo attached to
+  `--los` replaces it.
+
 ## Valves
 
 **Admin valves** (gear icon on the function):
@@ -215,9 +313,22 @@ persisted by Alpaka; no proxy restart needed.
 | `translate_system` | built-in | System instruction for the translation (a glossary fits in here) |
 | `lora_triggers` | empty | One `name_fragment \| trigger word` per line |
 | `auto_ar_from_image` | on | Aspect ratio from the attached image, globally |
+| `series_model` | empty | Ollama model that writes the prompt list for `--serie`; empty = image series off. For workflows with an image input it must process images (checked via `/api/show`) |
+| `series_keep_alive` | `0` | How long the prompt model stays loaded after the list (GPU work follows anyway) |
+| `series_num_ctx` | `0` | Context size (`num_ctx`) of the list request; `0` = Ollama's or the model's setting |
+| `series_system` | built-in | Instruction for the prompt LLM, workflows without image input |
+| `series_system_edit` | built-in | Instruction with input image, `--bildart edit`: short edit instructions |
+| `series_system_control` | built-in | Instruction with input image, `--bildart control`: describe the subject of the photo |
+| `series_max` | `20` | Upper limit for `--serie N` (counts prompts, not images) |
+| `series_ar_options` | `1:1, 4:3, 3:4, 3:2, 2:3, 16:9, 9:16` | Formats the LLM may pick for workflows without `ResolutionSelector` |
+
+The pipe appends count, length, the format ban, fixed requirements and the
+allowed formats to the `series_system*` texts itself, so these valves only
+hold the actual instruction.
 
 **User valves** (slider icon in the chat): `aspect_ratio`, `megapixels`,
-`batch_size`, `steps`, `seed`, `translate`, `show_prompt`, `auto_ar`.
+`batch_size`, `steps`, `seed`, `translate`, `show_prompt`, `auto_ar`,
+`series_words` (prompt length for image series, default 60).
 
 Precedence for the aspect ratio, first match wins: `--ar` in the message or
 saved defaults, then the attached image (if `auto_ar` is on), then the
@@ -228,26 +339,35 @@ saved defaults, then the attached image (if `auto_ar` is on), then the
 - Workflows: `/app/backend/data/comfy_workflows/*.json`
 - Saved defaults: `/app/backend/data/comfy_pipe_defaults.json`
 - Images: Open WebUI file storage (plus ComfyUI's own output folder)
+- Prompt lists of image series: only in the chat itself (the assistant
+  message with the `**Prompt-Serie**` header)
 - Uploaded input images: ComfyUI's input folder, named
   `owui_upload_<timestamp>_<random>_<n>.<ext>` – these accumulate; clean up
   occasionally if disk space matters
 
 ## A note on Open WebUI internals
 
-Three things rely on Open WebUI internals rather than a public API:
+Four things rely on Open WebUI internals or behaviour rather than a public
+API:
 
 - storing images as files (`open_webui.models.files`,
   `open_webui.storage.provider`)
 - setting chat titles (`open_webui.models.chats`)
 - recognising what Open WebUI itself writes into the system message (the
   `<memory_context>` block, the `[CONVERSATION SUMMARY]` prefix)
+- image series: Open WebUI streaming an async generator returned by a pipe
+  piece by piece, sending edited assistant messages as part of the history,
+  and resending images of earlier user messages as base64 (checked against
+  the Open WebUI v0.12.5 source and in the live setup)
 
 The first two are wrapped so that a changed internal API degrades gracefully
 (images fall back to inline Base64, titles are simply not set) and the reason
 shows up in the info line. For the third, a changed format would let
 memories or chat summaries reach the image prompt again; the info line notes
-every time such a block was removed. If an Open WebUI update breaks one of
-them, that is where to look.
+every time such a block was removed. For the fourth, a change would show as
+images arriving only at the end, edits to a list being ignored, or `--los`
+asking for an image again. If an Open WebUI update breaks one of them, that
+is where to look.
 
 ## Versioning
 
