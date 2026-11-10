@@ -1,11 +1,12 @@
 """
 title: OI-ComfyUI-Workflows
 author: Wolfgang Weber (WolfgangW77)
-version: 0.12.4
+version: 0.13.2
 license: MIT
 description: Exposes every API-format workflow in a directory as its own
 model. Controlled via flags in the prompt (--ar, --no, --steps ...),
-optional translation of non-English prompts via Ollama.
+optional translation of non-English prompts via Ollama. Serialises GPU
+access with the Alpaka Ollama Log Proxy (v5.3+) via a slot mechanism.
 requirements: aiohttp
 
 Written with AI assistance (Claude by Anthropic); reviewed and maintained
@@ -188,6 +189,77 @@ v0.12.4
   (Context Compaction) aus dem Systemprompt entfernt").
 - Image rendering itself was never affected: the pipe only reads the
   last user message, and compaction only summarises older ones.
+
+v0.13.0
+- GPU slot client for the Alpaka Ollama Log Proxy (v5.3+), per the slot
+  specification: before the translation step the pipe acquires the GPU
+  slot at POST /proxy/acquire (blocking long-poll, label = workflow
+  name, tag = chat id) and holds it across translation, ComfyUI job and
+  rendering; released in every end path (success, error, timeout, stop
+  button) from the pipe() wrapper, so no path can leak a slot. While
+  waiting, the pipe polls /proxy/status and shows its queue position
+  ("wartet auf freie GPU — Position N"); a user abort simply cancels
+  the acquire request and Alpaka's socket peek removes the entry.
+  Waiting does NOT count against timeout_seconds. A background task
+  sends a heartbeat every 10 s from grant to release; if the lease is
+  reported unknown (e.g. Alpaka restart), the job continues and the
+  info line notes it - no re-acquire. Uploads and option queries run
+  BEFORE the slot is taken (they need no GPU).
+- Translation requests carry the smuggled marker x_owui_slot with the
+  slot id, so Alpaka forwards them immediately although the slot holder
+  is the pipe itself.
+- New admin valves: proxy_url (Alpaka base URL), use_alpaka_proxy
+  (off = behave like v0.12.4, e.g. environments without Alpaka;
+  Alpaka unreachable while ON gives a clear error instead of silently
+  rendering without the gate) and unload_ollama_before_job (after the
+  grant, POST /proxy/unload evicts all loaded Ollama models before the
+  image job - costs the reload of the chat model afterwards, saves the
+  driver's VRAM eviction; default off).
+- Admin clean-up flags --kill-ollama-tasks and --unload-ollama [name]:
+  thin remote controls for Alpaka's admin endpoints, handled locally
+  like --help (no slot, no translation, no ComfyUI job - the emergency
+  broom must not wait in the very queue it is meant to sweep). They
+  only need proxy_url and work with use_alpaka_proxy off; restricted to
+  the OWUI role "admin" and listed in --help/--anleitung for admins
+  only. Flag names may contain hyphens now (FLAG_RE extended).
+
+v0.13.1
+- timeout_seconds is now a pure compute cap and 0 disables it: the
+  history loop stops capping, mirroring the removal of Alpaka's queue
+  timeout — the user sees the elapsed time and has the stop button.
+  Transport timeouts are hard-coded instead of riding on the valve
+  (connect 10 s, sock_read 120 s): they detect a dead socket, they do
+  not give up on a long render, and they stay active at 0.
+- New valve unload_comfy_after_job (default off): after a finished
+  image job — success, ComfyUI error or user abort, but not on a
+  compute-cap timeout, where the job may still be running — the pipe
+  POSTs ComfyUI's native /free with unload_models + free_memory, so
+  the GPU is handed back clean BEFORE the slot is released and the
+  returning chat model does not trigger the reverse VRAM eviction.
+  Costs the checkpoint reload on the next image job.
+- New admin flag --unload-comfy: manual counterpart, same /free call,
+  handled pipe-locally like the other clean-up flags (admin role only,
+  needs only comfy_url). The broom cupboard is now complete:
+  --kill-ollama-tasks (running Ollama work), --unload-ollama (Ollama
+  VRAM), --unload-comfy (ComfyUI VRAM).
+
+v0.13.2
+- The automatic VRAM clean-up moves to Alpaka v5.4 ("clean handover"):
+  freeing the other side's memory belongs right BEFORE the task that
+  needs it, not after the one that used it — an image series would
+  otherwise evict its own checkpoint between two renders, and only the
+  proxy sees chats coming. The valves unload_ollama_before_job and
+  unload_comfy_after_job are removed; configure CLEAN_HANDOVER
+  ("off"/"on"/"custom" with two per-direction sub-switches) in the
+  proxy instead. The manual admin flags (--kill-ollama-tasks,
+  --unload-ollama, --unload-comfy) stay in the pipe unchanged.
+- New admin flags for Alpaka's clean handover (switch it from the
+  chat, no proxy restart): --handover shows the current state,
+  --handover on|off|custom sets the mode, --handover-comfy 0/1 and
+  --handover-ollama 0/1 set the per-direction switches (which flips
+  the mode to "custom" automatically, proxy-side). Handled
+  pipe-locally like the other admin flags; the proxy persists changes
+  in alpaka_settings.json.
 """
 
 import asyncio
@@ -282,10 +354,21 @@ def _strip_wrappers(text: str) -> str:
     return re.sub(r"[ \t]*\n[ \t]*\n+", "\n\n", cleaned).strip()
 
 
-FLAG_RE = re.compile(r"(?:--|[\u2013\u2014])\s*([a-zA-Z][a-zA-Z0-9_]*)")
+FLAG_RE = re.compile(r"(?:--|[\u2013\u2014])\s*([a-zA-Z][a-zA-Z0-9_-]*)")
 
 # Flags that print something instead of rendering - they need no prompt
-COMMAND_FLAGS = {"help", "loras", "reset", "anleitung"}
+COMMAND_FLAGS = {
+    "help",
+    "loras",
+    "reset",
+    "anleitung",
+    "kill-ollama-tasks",
+    "unload-ollama",
+    "unload-comfy",
+    "handover",
+    "handover-comfy",
+    "handover-ollama",
+}  # admin clean-up + handover
 
 # Chat titles that count as "no title yet" (compared in lower case)
 EMPTY_TITLES = {"", "new chat", "neuer chat"}
@@ -376,7 +459,12 @@ class Pipe:
             description="Basis-URL der ComfyUI-Instanz, ohne abschließenden Schrägstrich.",
         )
         timeout_seconds: int = Field(
-            default=900, description="Abbruch, wenn ComfyUI länger braucht."
+            default=900,
+            description=(
+                "Rechen-Deckel ab Auftragsübermittlung; 0 = kein Deckel "
+                "(dann zählen nur Stopp-Knopf und die festen "
+                "Transport-Timeouts)."
+            ),
         )
         max_batch: int = Field(
             default=8, description="Obergrenze für --batch, schützt vor VRAM-Unfällen."
@@ -400,6 +488,23 @@ class Pipe:
         ollama_url: str = Field(
             default="http://host.docker.internal:11434",
             description="Ollama-Basis-URL für die Prompt-Übersetzung.",
+        )
+        proxy_url: str = Field(
+            default="http://host.docker.internal:11435",
+            description=(
+                "Basis-URL des Alpaka-Proxys (Slot- und Aufräum-Endpunkte), "
+                "ohne abschließenden Schrägstrich."
+            ),
+        )
+        use_alpaka_proxy: bool = Field(
+            default=True,
+            description=(
+                "Vor jedem Bildauftrag einen GPU-Slot beim Alpaka-Proxy (v5.3+) "
+                "ziehen, damit sich Bild- und Chat-Aufträge nicht um die GPU "
+                "prügeln. Aus = Verhalten wie v0.12.4 (für Umgebungen ohne "
+                "Alpaka). Ist Alpaka bei aktivem Schalter nicht erreichbar, "
+                "gibt es eine klare Fehlermeldung statt stillem Direktbetrieb."
+            ),
         )
         translate_model: str = Field(
             default="",
@@ -777,7 +882,7 @@ class Pipe:
         return raw
 
     async def _translate(
-        self, session, text: str
+        self, session, text: str, slot_id: Optional[str] = None
     ) -> tuple[Optional[str], Optional[str]]:
         v = self.valves
         url = v.ollama_url.rstrip("/") + "/api/generate"
@@ -787,6 +892,11 @@ class Pipe:
             "keep_alive": v.translate_keep_alive,
             "options": {"temperature": 0.2},
         }
+        if slot_id:
+            # v0.13.0: mark the request as belonging to the slot holder -
+            # Alpaka forwards it immediately despite the held slot and
+            # strips the marker before Ollama sees it.
+            base["x_owui_slot"] = slot_id
         # Anchor format: small models otherwise tend to echo the input back
         anchored = f"Text:\n{text}\n\nEnglish:"
         # Order of attempts:
@@ -1312,12 +1422,161 @@ class Pipe:
             "loras",
             "reset",
             "arauto",
+            "kill-ollama-tasks",  # v0.13.0: admin clean-up
+            "unload-ollama",  # v0.13.0: admin clean-up
+            "unload-comfy",  # v0.13.1: admin clean-up
+            "handover",  # v0.13.2: clean handover
+            "handover-comfy",  # v0.13.2: clean handover
+            "handover-ollama",  # v0.13.2: clean handover
         }
         known |= {f"lora{i}" for i in range(1, len(h["loras"]) + 1)}
         known |= set(h["markers"])
         known |= {m + "s" for m in h["markers"]}
         known |= {"loras", "ars"}
         return known
+
+    # ------------------------------------------------------------------
+    # GPU slot at the Alpaka proxy (v0.13.0)
+    # ------------------------------------------------------------------
+
+    def _proxy_base(self) -> str:
+        return self.valves.proxy_url.rstrip("/")
+
+    async def _proxy_post(self, path: str, payload: dict, timeout_s: float = 10):
+        """One short POST to Alpaka over its own connection. Returns
+        (data|None, err|None); on an HTTP error the parsed body is still
+        returned when possible (unload sends details that way). Never
+        raises."""
+        try:
+            timeout = aiohttp.ClientTimeout(total=timeout_s)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.post(self._proxy_base() + path, json=payload) as resp:
+                    data = None
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        pass
+                    if resp.status != 200:
+                        return data, f"HTTP {resp.status}"
+                    return data if data is not None else {}, None
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+
+    async def _proxy_get(self, path: str, timeout_s: float = 10):
+        """One short GET to Alpaka. Returns (data|None, err|None);
+        never raises. (v0.13.2)"""
+        try:
+            timeout = aiohttp.ClientTimeout(total=timeout_s)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(self._proxy_base() + path) as resp:
+                    data = None
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        pass
+                    if resp.status != 200:
+                        return data, f"HTTP {resp.status}"
+                    return data if data is not None else {}, None
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+
+    async def _slot_position(self, tag: str):
+        """Own position among Alpaka's waiting entries (or None)."""
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(self._proxy_base() + "/proxy/status") as resp:
+                    st = await resp.json()
+        except Exception:
+            return None
+        for entry in st.get("queue") or []:
+            if entry.get("kind") == "image" and entry.get("tag") == tag:
+                return entry.get("position")
+        return None
+
+    async def _acquire_slot(self, emitter, name: str, tag: str):
+        """Blocking acquire with position display. Returns (slot_id, err).
+        A user abort cancels the request - Alpaka's socket peek then
+        removes the waiting entry by itself. Waiting is deliberately NOT
+        bounded by timeout_seconds (slot specification)."""
+        timeout = aiohttp.ClientTimeout(total=None)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                post = asyncio.ensure_future(
+                    s.post(
+                        self._proxy_base() + "/proxy/acquire",
+                        json={"label": name, "tag": tag},
+                    )
+                )
+                try:
+                    while True:
+                        done, _ = await asyncio.wait({post}, timeout=1.5)
+                        if post in done:
+                            break
+                        pos = await self._slot_position(tag)
+                        if pos:
+                            await self._emit(
+                                emitter,
+                                f"{name}: wartet auf freie GPU — "
+                                f"Position {pos} in der Warteschlange ...",
+                            )
+                        else:
+                            await self._emit(
+                                emitter, f"{name}: wartet auf freie GPU ..."
+                            )
+                    resp = post.result()
+                except asyncio.CancelledError:
+                    post.cancel()
+                    raise
+                async with resp:
+                    if resp.status != 200:
+                        return None, f"HTTP {resp.status}"
+                    data = await resp.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+        slot_id = data.get("slot_id")
+        if not slot_id:
+            return None, "Antwort ohne slot_id"
+        return slot_id, None
+
+    async def _heartbeat_loop(self, slot_id: str, state: dict):
+        """Background task from grant to release: one heartbeat every
+        10 s. An 'unknown' answer means the lease expired (e.g. Alpaka
+        restart) - noted in state, the job itself continues, no
+        re-acquire (slot specification)."""
+        while True:
+            await asyncio.sleep(10)
+            data, err = await self._proxy_post(
+                "/proxy/heartbeat", {"slot_id": slot_id}, timeout_s=8
+            )
+            if err or not isinstance(data, dict):
+                continue  # transient - the next round tries again
+            if not data.get("ok"):
+                state["lost"] = True
+                return
+
+    async def _release_slot(self, slot_id: str):
+        """Give the slot back; idempotent on the proxy side, never raises."""
+        await self._proxy_post("/proxy/release", {"slot_id": slot_id})
+
+    async def _comfy_free(self):
+        """POST ComfyUI's native /free: unload model weights and clear the
+        execution cache, so the VRAM really goes back to the driver.
+        Returns (ok, err); never raises. (v0.13.1)"""
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.post(
+                    self.valves.comfy_url.rstrip("/") + "/free",
+                    json={"unload_models": True, "free_memory": True},
+                ) as resp:
+                    if resp.status != 200:
+                        return False, f"HTTP {resp.status}"
+                    return True, None
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
 
     async def _queue_position(
         self, session, base: str, prompt_id: str
@@ -1454,7 +1713,10 @@ angehängten Bild), `seed`, `steps`, `aspect_ratio`, `megapixels`,
   Aufträge werden gelöscht, laufende unterbrochen.
 - Bei Workflows mit Bildeingang folgt das Format dem angehängten Foto
   (nächstliegendes Seitenverhältnis), solange kein `--ar` gesetzt ist.
-  `--ar` gewinnt immer; `--arauto 0` schaltet es ab."""
+  `--ar` gewinnt immer; `--arauto 0` schaltet es ab.
+- Bild- und Chat-Aufträge teilen sich die Grafikkarte: ist sie belegt,
+  wartet der Bildauftrag — die Statuszeile zeigt die Position. Der
+  Stopp-Knopf bricht auch das Warten ab."""
 
         if not is_admin:
             return text
@@ -1494,7 +1756,28 @@ danach ggf. `--reset`.
 `ollama_url`, `translate_model`, `translate_keep_alive`,
 `translate_system` (verträgt ein Glossar), `lora_triggers`
 (`fragment | triggerwort` je Zeile), `store_images_as_files`,
-`auto_ar_from_image` (Format aus dem angehängten Bild, global an/aus).
+`auto_ar_from_image` (Format aus dem angehängten Bild, global an/aus),
+`proxy_url` (Alpaka-Basis-URL), `use_alpaka_proxy` (GPU-Slot vor jedem
+Bildauftrag; aus = Verhalten wie v0.12.4). Das automatische
+VRAM-Freiräumen wohnt seit v0.13.2 im Alpaka-Proxy (Saubere Übergabe) —
+zur Laufzeit schaltbar per `--handover`, die Dateikopf-Konstanten sind
+nur die Erststart-Vorgaben.
+
+## Aufräum-Kommandos (nur Admins)
+
+| Kürzel | Wirkung |
+|---|---|
+| `--kill-ollama-tasks` | bricht alle laufenden Ollama-Anfragen über den Alpaka-Proxy ab |
+| `--unload-ollama [name]` | entlädt Ollama-Modelle per keep_alive 0 (ohne Name: alle) |
+| `--unload-comfy` | gibt ComfyUIs Speicher frei (Modelle entladen, Cache leeren) |
+| `--handover [on/off/custom]` | zeigt (ohne Wert) oder setzt Alpakas Saubere Übergabe |
+| `--handover-comfy 0/1`, `--handover-ollama 0/1` | Einzelschalter je Richtung (stellt automatisch auf custom) |
+
+Beide laufen pipe-lokal: kein GPU-Slot, keine Übersetzung, kein
+ComfyUI-Auftrag — sie funktionieren also auch, wenn alle Chat-Modelle
+festhängen, und unabhängig von `use_alpaka_proxy`. Reihenfolge im
+Störfall: erst kill (räumt Rechnendes), dann unload (räumt VRAM —
+Ollama- und ComfyUI-Seite je nach Bedarf).
 
 ## Ablageorte
 
@@ -1529,6 +1812,7 @@ in der Info-Zeile vermerkt.
         wf: dict,
         defaults: Optional[dict] = None,
         listers: Optional[dict] = None,
+        is_admin: bool = False,
     ) -> str:
         listers = listers or {}
         lines = [f"**{name}** - erkannte Stellhebel:", ""]
@@ -1636,6 +1920,17 @@ in der Info-Zeile vermerkt.
                 "",
                 "**Gespeicherte Vorgaben** (übersteuern die Datei-Werte oben, `--reset` löscht):",
             ] + [f"- `--{k} {v}`".rstrip() for k, v in defaults.items()]
+        if is_admin:
+            lines += [
+                "",
+                "**Aufräum-Kommandos (nur Admins):** `--kill-ollama-tasks` bricht "
+                "laufende Ollama-Anfragen über den Alpaka-Proxy ab, "
+                "`--unload-ollama [name]` entlädt Ollama-Modelle (ohne Name: alle), "
+                "`--unload-comfy` gibt ComfyUIs Speicher frei, `--handover` "
+                "zeigt/schaltet Alpakas Saubere Übergabe (on/off/custom, "
+                "Einzelschalter --handover-comfy/--handover-ollama 0/1). "
+                "Alle laufen pipe-lokal — kein GPU-Slot, keine Übersetzung.",
+            ]
         lines += []
         return "\n".join(lines)
 
@@ -1668,9 +1963,17 @@ in der Info-Zeile vermerkt.
         started = time.monotonic()
         cancelled = False
         abort_note = None
+        # v0.13.0: slot bookkeeping lives here so that EVERY end path of
+        # _run (return, error, stop button) releases the GPU slot.
+        slot_ctx = {"slot_id": None, "hb_task": None, "state": {"lost": False}}
         try:
             return await self._run(
-                body, __user__, __event_emitter__, __task__, __metadata__
+                body,
+                __user__,
+                __event_emitter__,
+                __task__,
+                __metadata__,
+                slot_ctx,
             )
         except asyncio.CancelledError as e:
             # Stop button in Open WebUI. What _run cleaned up at ComfyUI is
@@ -1679,6 +1982,11 @@ in der Info-Zeile vermerkt.
             abort_note = getattr(e, "comfy_note", None)
             raise
         finally:
+            if slot_ctx["hb_task"] is not None:
+                slot_ctx["hb_task"].cancel()
+            if slot_ctx["slot_id"]:
+                # shield: the release must go through even on a second stop
+                await asyncio.shield(self._release_slot(slot_ctx["slot_id"]))
             elapsed = time.monotonic() - started
             if cancelled:
                 text = "Abgebrochen"
@@ -1700,9 +2008,15 @@ in der Info-Zeile vermerkt.
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
         __task__: Optional[str] = None,
         __metadata__: Optional[dict] = None,
+        _slot_ctx: Optional[dict] = None,
     ) -> str:
         if __task__:
             return "ComfyUI"
+        _slot_ctx = (
+            _slot_ctx
+            if _slot_ctx is not None
+            else {"slot_id": None, "hb_task": None, "state": {"lost": False}}
+        )
 
         pipe_id = str(body.get("model", "")).split(".")[-1]
 
@@ -1738,10 +2052,149 @@ in der Info-Zeile vermerkt.
             is_admin = str((__user__ or {}).get("role", "")).lower() == "admin"
             return self._manual(is_admin)
 
+        # --- Admin clean-up flags (v0.13.0) ---
+        # Handled locally like --help: no slot, no translation, no ComfyUI
+        # job - the emergency broom must not wait in the very queue it is
+        # meant to sweep. Needs only proxy_url; works with
+        # use_alpaka_proxy off.
+        if (
+            "kill-ollama-tasks" in flags
+            or "unload-ollama" in flags
+            or "unload-comfy" in flags
+            or "handover" in flags
+            or "handover-comfy" in flags
+            or "handover-ollama" in flags
+        ):
+            if str((__user__ or {}).get("role", "")).lower() != "admin":
+                return "Die Aufräum-Kommandos sind Administratoren vorbehalten."
+            out: list[str] = []
+            if "kill-ollama-tasks" in flags:
+                data, err = await self._proxy_post("/proxy/kill-tasks", {})
+                if err:
+                    out.append(
+                        f"**kill-tasks fehlgeschlagen** ({err}) — läuft der "
+                        f"Alpaka-Proxy unter `{self._proxy_base()}`?"
+                    )
+                else:
+                    victims = (data or {}).get("killed") or []
+                    if victims:
+                        out.append(
+                            f"**{len(victims)} laufende Ollama-Anfrage(n) "
+                            "abgebrochen:**\n"
+                            + "\n".join(
+                                f"- #{v.get('qid')} {v.get('model')}"
+                                + (f" (Tag {v.get('tag')})" if v.get("tag") else "")
+                                for v in victims
+                            )
+                        )
+                    else:
+                        out.append(
+                            "Keine laufende Ollama-Anfrage — nichts abzubrechen."
+                        )
+            if "unload-ollama" in flags:
+                frag = str(flags.get("unload-ollama") or "").strip()
+                data, err = await self._proxy_post(
+                    "/proxy/unload", {"model": frag} if frag else {}, timeout_s=90
+                )
+                data = data or {}
+                if err and not data:
+                    out.append(
+                        f"**unload fehlgeschlagen** ({err}) — läuft der "
+                        f"Alpaka-Proxy unter `{self._proxy_base()}`?"
+                    )
+                elif data.get("unloaded"):
+                    out.append("**Entladen:** " + ", ".join(data["unloaded"]))
+                elif data.get("ok"):
+                    out.append("Kein Modell geladen — nichts zu entladen.")
+                else:
+                    detail = data.get("error") or err or "unbekannter Fehler"
+                    if data.get("matches"):
+                        detail += " — Treffer: " + ", ".join(data["matches"])
+                    if data.get("loaded"):
+                        detail += " — geladen: " + ", ".join(data["loaded"])
+                    out.append(f"**unload abgelehnt:** {detail}")
+            if "unload-comfy" in flags:
+                ok_free, err_free = await self._comfy_free()
+                if ok_free:
+                    out.append(
+                        "**ComfyUI-Speicher freigegeben** "
+                        "(Modelle entladen, Cache geleert)."
+                    )
+                else:
+                    out.append(
+                        f"**ComfyUI-Freigabe fehlgeschlagen** ({err_free}) — "
+                        f"läuft ComfyUI unter `{self.valves.comfy_url}`?"
+                    )
+            if (
+                "handover" in flags
+                or "handover-comfy" in flags
+                or "handover-ollama" in flags
+            ):
+                payload = {}
+                errs = []
+                if "handover" in flags:
+                    mode = str(flags.get("handover") or "").strip().lower()
+                    if mode and mode in ("on", "off", "custom"):
+                        payload["mode"] = mode
+                    elif mode:
+                        errs.append(
+                            f"unbekannter Modus `{mode}` — erlaubt: on, off, custom"
+                        )
+                for fname, key in (
+                    ("handover-comfy", "free_comfy"),
+                    ("handover-ollama", "unload_ollama"),
+                ):
+                    if fname in flags:
+                        val = str(flags.get(fname) or "").strip()
+                        if val in ("0", "1"):
+                            payload[key] = val == "1"
+                        else:
+                            errs.append(f"`--{fname}` erwartet 0 oder 1")
+                if errs:
+                    out.append("**Saubere Übergabe:** " + "; ".join(errs))
+                else:
+                    if payload:
+                        data, err = await self._proxy_post("/proxy/handover", payload)
+                    else:
+                        data, err = await self._proxy_get("/proxy/handover")
+                    data = data or {}
+                    if err and not data:
+                        out.append(
+                            f"**Saubere Übergabe nicht erreichbar** ({err}) — "
+                            f"läuft der Alpaka-Proxy unter `{self._proxy_base()}`?"
+                        )
+                    elif not data.get("mode"):
+                        out.append(
+                            "**Saubere Übergabe:** unerwartete Antwort"
+                            + (f" ({err})" if err else "")
+                            + " — Alpaka v5.4 oder neuer nötig."
+                        )
+                    else:
+                        eff = data.get("effective") or {}
+                        txt = (
+                            f"**Saubere Übergabe:** Modus **{data['mode']}** — "
+                            f"Comfy-Freigabe vor Chats: "
+                            f"{'an' if eff.get('free_comfy') else 'aus'}, "
+                            f"Ollama-Entladen vor Bildjobs: "
+                            f"{'an' if eff.get('unload_ollama') else 'aus'}"
+                        )
+                        if data.get("note"):
+                            txt += f"\n⚠️ {data['note']}"
+                        if data.get("save_error"):
+                            txt += (
+                                f"\n⚠️ Einstellung nicht gespeichert: "
+                                f"{data['save_error']}"
+                            )
+                        out.append(txt)
+            return "\n\n".join(out)
+
         has_image_input = bool(h.get("image")) and bool(self._extract_images(body))
         if "help" in flags or (not raw.strip() and not has_image_input):
             help_defaults = self._load_defaults((__user__ or {}).get("id"), pipe_id)
-            return self._describe(name, h, wf, help_defaults, self._listers(h, wf))
+            is_admin = str((__user__ or {}).get("role", "")).lower() == "admin"
+            return self._describe(
+                name, h, wf, help_defaults, self._listers(h, wf), is_admin
+            )
 
         if not h.get("prompt"):
             return (
@@ -1955,7 +2408,10 @@ in der Info-Zeile vermerkt.
             )
 
         try:
-            timeout = aiohttp.ClientTimeout(total=self.valves.timeout_seconds)
+            # v0.13.1: transport timeouts only — they detect a dead
+            # socket, they do not give up on a long render. The compute
+            # cap lives in the history loop (timeout_seconds, 0 = off).
+            timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=120)
             async with aiohttp.ClientSession(timeout=timeout) as session:
 
                 for lister, (kind, payload) in listers.items():
@@ -2089,6 +2545,31 @@ in der Info-Zeile vermerkt.
                     self._set(wf, handle, flags[marker_name])
                     used.append(f"{marker_name}: {flags[marker_name]}")
 
+                # --- GPU slot at Alpaka (v0.13.0) ---
+                # Deliberately only here: uploads and option queries above
+                # need no GPU. From this point on (translation -> ComfyUI
+                # job -> rendering) the slot is held; pipe() releases it in
+                # every end path.
+                if self.valves.use_alpaka_proxy:
+                    slot_tag = str(
+                        (__metadata__ or {}).get("chat_id")
+                        or f"comfy-{random.randint(10000, 99999)}"
+                    )
+                    slot_id, slot_err = await self._acquire_slot(
+                        __event_emitter__, name, slot_tag
+                    )
+                    if slot_err:
+                        return (
+                            f"**GPU-Slot bei Alpaka nicht erhalten** ({slot_err}).\n\n"
+                            f"Läuft der Proxy unter `{self._proxy_base()}`? Ohne ihn "
+                            "rendert die Pipe nur, wenn die Admin-Valve "
+                            "`use_alpaka_proxy` abgeschaltet wird."
+                        )
+                    _slot_ctx["slot_id"] = slot_id
+                    _slot_ctx["hb_task"] = asyncio.create_task(
+                        self._heartbeat_loop(slot_id, _slot_ctx["state"])
+                    )
+
                 # --- Translation ---
                 final_prompt = prompt
                 do_translate = user_valves.translate
@@ -2097,7 +2578,9 @@ in der Info-Zeile vermerkt.
                 if do_translate and self.valves.translate_model:
                     await self._emit(__event_emitter__, "Prompt wird übersetzt ...")
                     masked, kept = self._protect(prompt)
-                    english, err = await self._translate(session, masked)
+                    english, err = await self._translate(
+                        session, masked, _slot_ctx["slot_id"]
+                    )
                     if err:
                         used.append(
                             f"Übersetzung fehlgeschlagen ({err}), Original verwendet"
@@ -2111,7 +2594,9 @@ in der Info-Zeile vermerkt.
                         else:
                             used.append(f"übersetzt mit {self.valves.translate_model}")
                     if h.get("negative") and flags.get("no"):
-                        neg_en, neg_err = await self._translate(session, flags["no"])
+                        neg_en, neg_err = await self._translate(
+                            session, flags["no"], _slot_ctx["slot_id"]
+                        )
                         if neg_en and not neg_err:
                             self._set(wf, h["negative"], neg_en)
                 elif do_translate:
@@ -2239,8 +2724,11 @@ in der Info-Zeile vermerkt.
                     try:
                         while True:
                             elapsed = time.monotonic() - started
-                            if elapsed > self.valves.timeout_seconds:
-                                break
+                            if (
+                                self.valves.timeout_seconds
+                                and elapsed > self.valves.timeout_seconds
+                            ):
+                                break  # v0.13.1: 0 = no compute cap
                             async with session.get(
                                 f"{base}/history/{prompt_id}"
                             ) as resp:
@@ -2365,6 +2853,11 @@ in der Info-Zeile vermerkt.
 
                 if store_error:
                     used.append(f"Dateiablage übersprungen ({store_error})")
+                if _slot_ctx["state"].get("lost"):
+                    used.append(
+                        "Hinweis: die GPU-Slot-Lease war zwischenzeitlich verfallen "
+                        "(Alpaka neu gestartet?) — der Auftrag lief trotzdem weiter"
+                    )
 
                 await self._emit(__event_emitter__, "Fertig", done=True)
                 out = "\n\n".join(blocks)
