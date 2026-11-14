@@ -1,9 +1,9 @@
 """
 title: OI-ComfyUI-Workflows
 author: Wolfgang Weber (WolfgangW77 on github)
-version: 0.14.1
+version: 0.15.0
 license: MIT
-description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), image series from an LLM-written prompt list (--serie, --los; the LLM sees the input image of image workflows), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
+description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), image series from an LLM-written prompt list (--serie, --los; the LLM sees the input image of image workflows; optional spoken commands at the end of a dictation), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
 requirements: aiohttp
 
 Written with AI assistance (Claude by Anthropic); reviewed and maintained
@@ -382,6 +382,35 @@ v0.14.1
 - --words and --bildart are checked in the shared validation stage
   (_normalize), i.e. already when saved as defaults (principle since
   v0.6.0): --words must be a number from 0, --bildart edit or control.
+
+v0.15.0
+- Spoken commands (user valve voice_commands, default off): a dictated
+  text (Whisper STT, often without punctuation) may end with commands
+  after the signal word "Serie" - count (a number right after "Serie",
+  or "zehn Bilder", "10 Prompts", "5 Stück"), length ("130 Worte"),
+  "Querformat" (16:9), "Hochformat" (9:16), "quadratisch" (1:1),
+  "sofort starten" / "sofort" (--nowait), "los" with optional numbers
+  (--los 1,3,5). Digits or German number words up to 500; fillers (und,
+  bitte, mit, je, von, im, in, als, jeweils, lang, Nummer) and
+  punctuation are skipped. The last "Serie" directly followed by a
+  command starts the command part; everything after it must be
+  understood, otherwise the pipe stops with a message naming the unknown
+  words (no LLM request, no slot). "Serie los" without a brief renders
+  the latest list, with a brief it works like --nowait. Typed flags win
+  (with a note). The generated flags behave exactly like typed ones and
+  are shown as a note ("Sprachbefehle: ..."); --los re-reads the --serie
+  message with the same recognition, so a dictated format still applies.
+- Total length hint (planned as v0.14.2, merged into this version): with
+  a target length, when prompts x words reaches the new admin valve
+  series_total_hint (default 600, 0 = off), the list request adds "In
+  total about 2,400 words are expected (20 prompts x about 120 words). A
+  long answer is fine - do not shorten individual prompts to save
+  space." Models tend to shorten the single prompts of long lists
+  (gemma4: 20 x 120 words gave an average of 68). With show_prompt the
+  info line notes that the hint was sent.
+- Flags start with "--" or the em dash (U+2014, Open WebUI turns "--"
+  into it) only; the en dash (U+2013) no longer starts a flag - it did
+  so before, undocumented.
 """
 
 import asyncio
@@ -481,6 +510,40 @@ DEFAULT_SERIES_SYSTEM_CONTROL = (
 LIST_HEADER = "**Prompt-Serie**"  # first line of a prompt list in the chat
 # One list entry: "3. [16:9] text" or "3. text" (also "3)")
 LIST_LINE_RE = re.compile(r"^\s*(\d+)[.)]\s+(?:\[([^\]]*)\]\s*)?(.*\S)\s*$")
+# v0.15.0: total length hint, appended when prompts x words >= series_total_hint
+SERIES_TOTAL_HINT = (
+    "In total about {total:,} words are expected ({n} {prompts} × about {words} "
+    "words). A long answer is fine – do not shorten individual prompts to save space."
+)
+
+# --- Spoken commands (v0.15.0) ---
+# A dictated text may end with "Serie" plus commands; see _voice_parse.
+VOICE_SIGNAL = "serie"
+VOICE_PUNCT = ".,;:!?"  # stripped from both ends of every word
+VOICE_FILLERS = {
+    "und", "bitte", "mit", "je", "von", "im", "in", "als", "jeweils", "lang",
+    "nummer", "nummern",
+}
+VOICE_COUNT_UNITS = {"bilder", "bildern", "bild", "prompts", "prompt", "stück"}
+VOICE_WORD_UNITS = {"worte", "wörter", "worten", "wörtern"}
+VOICE_FORMATS = {"querformat": "16:9", "hochformat": "9:16", "quadratisch": "1:1"}
+_DE_UNITS = {
+    "ein": 1, "eins": 1, "zwei": 2, "zwo": 2, "drei": 3, "vier": 4, "fünf": 5,
+    "sechs": 6, "sieben": 7, "acht": 8, "neun": 9,
+}
+_DE_TEENS = {
+    "zehn": 10, "elf": 11, "zwölf": 12, "dreizehn": 13, "vierzehn": 14,
+    "fünfzehn": 15, "sechzehn": 16, "siebzehn": 17, "achtzehn": 18, "neunzehn": 19,
+}
+_DE_TENS = {
+    "zwanzig": 20, "dreißig": 30, "dreissig": 30, "vierzig": 40, "fünfzig": 50,
+    "sechzig": 60, "siebzig": 70, "achtzig": 80, "neunzig": 90,
+}
+_DE_COMPOUND_RE = re.compile(
+    r"(ein|zwei|drei|vier|fünf|sechs|sieben|acht|neun)und("
+    + "|".join(_DE_TENS)
+    + r")"
+)
 
 # Nodes recognised by their class_type: class_type -> input field
 SEED_FIELDS = {
@@ -540,7 +603,181 @@ def _strip_wrappers(text: str) -> str:
     return re.sub(r"[ \t]*\n[ \t]*\n+", "\n\n", cleaned).strip()
 
 
-FLAG_RE = re.compile(r"(?:--|[\u2013\u2014])\s*([a-zA-Z][a-zA-Z0-9_-]*)")
+def _de_below_100(word: str) -> Optional[int]:
+    if word in _DE_UNITS:
+        return _DE_UNITS[word]
+    if word in _DE_TEENS:
+        return _DE_TEENS[word]
+    if word in _DE_TENS:
+        return _DE_TENS[word]
+    m = _DE_COMPOUND_RE.fullmatch(word)
+    if m:
+        return _DE_UNITS[m.group(1)] + _DE_TENS[m.group(2)]
+    return None
+
+
+def _de_number(word: str) -> Optional[int]:
+    """A number given as digits or as a German number word below 1000
+    ("zwölf", "dreiundzwanzig", "hundertzwanzig", "einhundertfünfzig").
+    None if the word is no number. (v0.15.0)"""
+    word = word.lower()
+    if re.fullmatch(r"[0-9]+", word):
+        return int(word)
+    if "hundert" in word:
+        pre, _sep, post = word.partition("hundert")
+        if pre in ("", "ein"):
+            hundreds = 1
+        elif pre in _DE_UNITS and pre != "eins":
+            hundreds = _DE_UNITS[pre]
+        else:
+            return None
+        if post.startswith("und"):
+            post = post[3:]  # "hundertundzwanzig"
+        rest = _de_below_100(post) if post else 0
+        if rest is None:
+            return None
+        return hundreds * 100 + rest
+    return _de_below_100(word)
+
+
+def _voice_parse(text: str) -> Optional[dict]:
+    """Spoken commands at the end of a dictated text (v0.15.0).
+
+    The command part starts at the last "Serie" that is directly followed
+    (after fillers) by a command; everything after it must be a command or
+    a filler. Case and punctuation at the words do not matter - Whisper
+    often sets no punctuation at all. Returns None when there is no
+    command part, otherwise a dict with
+      prompt  - the text before the command part
+      flags   - the generated flags (serie, los, words, ar, nowait)
+      spoken  - flag -> spoken words, for notes
+      unknown - words that were not understood (non-empty = stop)
+      tail    - the command part as dictated
+    """
+    tokens = []
+    for m in re.finditer(r"\S+", text):
+        tokens.append((m.group(0).strip(VOICE_PUNCT).lower(), m.start(), m.group(0)))
+
+    def is_command_start(word: str) -> bool:
+        return (
+            _de_number(word) is not None
+            or word in VOICE_FORMATS
+            or word in ("sofort", "los")
+        )
+
+    def skip_fillers(j: int) -> int:
+        while j < len(tokens) and (not tokens[j][0] or tokens[j][0] in VOICE_FILLERS):
+            j += 1
+        return j
+
+    start = None
+    for i, (word, _pos, _orig) in enumerate(tokens):
+        if word != VOICE_SIGNAL:
+            continue
+        j = skip_fillers(i + 1)
+        if j < len(tokens) and is_command_start(tokens[j][0]):
+            start = i
+
+    if start is None:
+        return None
+
+    count = words = ar = None
+    nowait = los = False
+    selection: list = []
+    spoken: dict = {}
+    unknown: list = []
+    first = True  # no command read yet: a bare number is the count
+    in_selection = False  # numbers right after "los" select list entries
+    k = start + 1
+    while k < len(tokens):
+        word, _pos, orig = tokens[k]
+        shown = orig.strip(VOICE_PUNCT)
+        if not word or word in VOICE_FILLERS:
+            k += 1
+            continue
+        nxt = tokens[k + 1][0] if k + 1 < len(tokens) else ""
+        number = _de_number(word)
+        if number is not None and nxt in VOICE_COUNT_UNITS:
+            count = number
+            spoken["serie"] = f"{shown} {tokens[k + 1][2].strip(VOICE_PUNCT)}"
+            in_selection = False
+            k += 2
+        elif number is not None and nxt in VOICE_WORD_UNITS:
+            words = number
+            spoken["words"] = f"{shown} {tokens[k + 1][2].strip(VOICE_PUNCT)}"
+            in_selection = False
+            k += 2
+        elif number is not None and in_selection:
+            selection.append(number)
+            k += 1
+        elif number is not None and first:
+            count = number
+            spoken["serie"] = f"Serie {shown}"
+            k += 1
+        elif in_selection and re.fullmatch(r"[0-9]+(?:,[0-9]+)+", word):
+            selection.extend(int(x) for x in word.split(","))
+            k += 1
+        elif word in VOICE_FORMATS:
+            ar = VOICE_FORMATS[word]
+            spoken["ar"] = shown
+            in_selection = False
+            k += 1
+        elif word == "sofort":
+            nowait = True
+            spoken["nowait"] = shown
+            in_selection = False
+            k += 1
+            if k < len(tokens) and tokens[k][0] == "starten":
+                spoken["nowait"] = f"{shown} {tokens[k][2].strip(VOICE_PUNCT)}"
+                k += 1
+        elif word == "los":
+            los = True
+            in_selection = True
+            k += 1
+        else:
+            unknown.append(shown)
+            in_selection = False
+            k += 1
+        first = False
+
+    prompt = text[: tokens[start][1]].rstrip()
+    while prompt and prompt[-1] in ",;:":
+        prompt = prompt[:-1].rstrip()
+    selection_text = ",".join(str(x) for x in selection)
+    if los:
+        spoken["los"] = ("los " + " ".join(str(x) for x in selection)).strip()
+
+    flags: dict = {}
+    if los and not prompt and count is None:
+        # "Serie los": render the latest list; "sofort" means the same here
+        flags["los"] = selection_text
+        if words is not None:
+            flags["words"] = str(words)
+        if ar:
+            flags["ar"] = ar
+    else:
+        flags["serie"] = str(count) if count is not None else ""
+        if los:
+            flags["los"] = selection_text
+        if words is not None:
+            flags["words"] = str(words)
+        if ar:
+            flags["ar"] = ar
+        if nowait:
+            flags["nowait"] = ""
+    spoken.setdefault("serie", "Serie")
+    return {
+        "prompt": prompt,
+        "flags": flags,
+        "spoken": spoken,
+        "unknown": unknown,
+        "tail": text[tokens[start][1] :].strip(),
+    }
+
+
+# v0.15.0: "--" or the em dash Open WebUI makes of it; the en dash no
+# longer starts a flag
+FLAG_RE = re.compile(r"(?:--|\u2014)\s*([a-zA-Z][a-zA-Z0-9_-]*)")
 
 # Flags that print something instead of rendering - they need no prompt
 COMMAND_FLAGS = {
@@ -800,6 +1037,14 @@ class Pipe:
                 "ResolutionSelector (nur Breite/Höhe) wählt; kommagetrennt."
             ),
         )
+        series_total_hint: int = Field(
+            default=600,
+            description=(
+                "Bildserien: ab dieser Gesamtlänge (Prompts × Wörter) bittet die Pipe "
+                "das Prompt-Modell ausdrücklich, die einzelnen Prompts nicht zu "
+                "kürzen. 0 = aus."
+            ),
+        )
 
     class UserValves(BaseModel):
         aspect_ratio: str = Field(
@@ -836,6 +1081,13 @@ class Pipe:
             description=(
                 "Bildserien: ungefähre Länge je Prompt in englischen Wörtern. "
                 "0 = keine Vorgabe, höchstens 500. Einmalig per --words."
+            ),
+        )
+        voice_commands: bool = Field(
+            default=False,
+            description=(
+                "Gesprochene Befehle am Ende eines Diktats (Signalwort „Serie“) "
+                "in Kürzel umsetzen."
             ),
         )
 
@@ -2088,12 +2340,39 @@ Bildprompts, danach werden sie nacheinander gerendert.
 - Die Grafikkarte bleibt für die ganze Serie belegt -- Chats warten so
   lange. Während die Liste nur angezeigt wird, ist nichts belegt.
 
+### Sprachbefehle beim Diktat
+
+Mit `voice_commands` in der Chat-Steuerung (Standard aus) setzt die
+Pipe gesprochene Befehle am Ende eines Diktats in Kürzel um. Sie stehen
+hinter dem Signalwort „Serie“:
+
+| gesprochen | wird zu |
+|---|---|
+| „Serie zehn“, „zehn Bilder“, „10 Prompts“, „5 Stück“ | `--serie 10` usw. |
+| „130 Worte“, „mit je 150 Wörtern“ | `--words 130` usw. |
+| „Querformat“ / „Hochformat“ / „quadratisch“ | `--ar 16:9` / `--ar 9:16` / `--ar 1:1` |
+| „sofort starten“, „sofort“ | `--nowait` |
+| „Serie los“, „Serie los 1, 3 und 5“ | `--los`, `--los 1,3,5` |
+
+- Beispiel: „Eine Katze läuft über eine Straße Serie 10 Bilder 130
+  Worte quadratisch sofort starten“ -- die Vorgabe ist der Text davor.
+- Zahlen als Ziffern oder Zahlwörter bis 500. Füllwörter („und“,
+  „bitte“, „mit“, „je“, „jeweils“, „von“, „im“, „in“, „als“, „lang“,
+  „Nummer“) und Satzzeichen werden übergangen.
+- Es zählt das letzte „Serie“, dem direkt ein Befehl folgt; ab dort muss
+  alles Befehl sein. Wird ein Teil nicht verstanden, hält die Pipe mit
+  einer Meldung an. „Eine Serie von Leuchttürmen“ bleibt normaler Text.
+- Steht vor „Serie los“ eine Vorgabe, wirkt „los“ wie „sofort starten“.
+- Getippte Kürzel gehen vor. Die erkannten Befehle stehen als Hinweis
+  bei der Liste und wirken genau wie getippte.
+
 ## Chat-Steuerung (Schieberegler-Symbol)
 
 `translate` (Übersetzung dauerhaft an), `show_prompt` (Info-Zeile
 unter dem Bild -- anfangs anschalten!), `auto_ar` (Format aus dem
 angehängten Bild), `seed`, `steps`, `aspect_ratio`, `megapixels`,
-`batch_size`, `series_words` (Promptlänge bei Bildserien).
+`batch_size`, `series_words` (Promptlänge bei Bildserien),
+`voice_commands` (Sprachbefehle beim Diktat).
 
 ## Gut zu wissen
 
@@ -2166,7 +2445,10 @@ Modells), `series_system` (Anweisung ans Prompt-Modell ohne Bild),
 nach `--bildart`; Anzahl, Länge, Format-Verbot, feste Vorgaben und
 Formate hängt die Pipe jeweils selbst an), `series_max` (Obergrenze für `--serie N`,
 zählt Prompts), `series_ar_options` (Formatauswahl für Workflows ohne
-ResolutionSelector). Die Prompt-Anfrage läuft ohne GPU-Slot als normale
+ResolutionSelector), `series_total_hint` (ab dieser Gesamtlänge
+Prompts × Wörter bittet die Pipe das Prompt-Modell ausdrücklich, die
+einzelnen Prompts nicht zu kürzen; Standard 600, 0 = aus). Die
+Prompt-Anfrage läuft ohne GPU-Slot als normale
 Anfrage über `ollama_url`; der Slot wird erst zum Rendern gezogen und
 dann für die ganze Serie gehalten. Ein Systemprompt am Workspace-Modell
 geht bei Serien als feste Vorgabe an das Prompt-Modell.
@@ -2221,6 +2503,7 @@ in der Info-Zeile vermerkt.
         defaults: Optional[dict] = None,
         listers: Optional[dict] = None,
         is_admin: bool = False,
+        voice: bool = False,
     ) -> str:
         listers = listers or {}
         lines = [f"**{name}** - erkannte Stellhebel:", ""]
@@ -2334,6 +2617,15 @@ in der Info-Zeile vermerkt.
                 if self.valves.series_model.strip()
                 else "⚠ Derzeit nicht verfügbar — Admin-Valve `series_model` ist leer."
             ),
+        ]
+        if voice:  # v0.15.0
+            lines += [
+                "",
+                "**Sprachbefehle (an):** ein diktierter Text kann mit Befehlen hinter "
+                "„Serie“ enden, z. B. „… Serie zehn Bilder 130 Worte Querformat sofort "
+                "starten“ oder „Serie los 1, 3 und 5“ — Einzelheiten in `--anleitung`.",
+            ]
+        lines += [
             "",
             "**Zum Kopieren:** "
             + " ".join(f"`--{l}`" for l in sorted(listers))
@@ -2466,6 +2758,32 @@ in der Info-Zeile vermerkt.
         h = self._analyze(wf)
         raw = _strip_wrappers(raw)
         prompt, flags = self._parse_flags(raw)
+
+        # --- Spoken commands (v0.15.0) ---
+        # Turned into flags before anything else looks at them, so they
+        # behave exactly like typed ones; typed flags win.
+        voice_hints: list[str] = []
+        if getattr(user_valves, "voice_commands", False):
+            voice = _voice_parse(prompt)
+            if voice is not None:
+                if voice["unknown"]:
+                    return self._voice_halt_text(voice)
+                prompt = voice["prompt"]
+                applied: dict = {}
+                for key, value in voice["flags"].items():
+                    if key in flags:
+                        typed = f"--{key} {flags[key]}".rstrip()
+                        voice_hints.append(
+                            f"Sprachbefehl „{voice['spoken'].get(key, key)}“ "
+                            f"übergangen — getippt: `{typed}`"
+                        )
+                    else:
+                        flags[key] = value
+                        applied[key] = value
+                if applied:
+                    shown = " ".join(f"--{k} {v}".rstrip() for k, v in applied.items())
+                    voice_hints.insert(0, f"Sprachbefehle: `{shown}`")
+                    await self._emit(__event_emitter__, f"Sprachbefehle: {shown}")
 
         # PIPE_INTERNAL nodes leave the job here; wf is a fresh copy per
         # request, so the workflow file stays untouched. --help still
@@ -2628,6 +2946,7 @@ in der Info-Zeile vermerkt.
                 h,
                 prompt,
                 flags,
+                voice_hints,
             )
 
         has_image_input = bool(h.get("image")) and bool(self._extract_images(body))
@@ -2635,7 +2954,13 @@ in der Info-Zeile vermerkt.
             help_defaults = self._load_defaults((__user__ or {}).get("id"), pipe_id)
             is_admin = str((__user__ or {}).get("role", "")).lower() == "admin"
             return self._describe(
-                name, h, wf, help_defaults, self._listers(h, wf), is_admin
+                name,
+                h,
+                wf,
+                help_defaults,
+                self._listers(h, wf),
+                is_admin,
+                bool(getattr(user_valves, "voice_commands", False)),
             )
 
         if not h.get("prompt"):
@@ -3517,6 +3842,23 @@ in der Info-Zeile vermerkt.
     # Image series (v0.14.0)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _voice_halt_text(voice: dict) -> str:
+        """Message when the spoken command part was only partly understood
+        (v0.15.0): nothing is started."""
+        unknown = ", ".join(f"„{w}“" for w in voice["unknown"])
+        known = " ".join(f"--{k} {v}".rstrip() for k, v in voice["flags"].items())
+        return (
+            f"**Sprachbefehl nicht verstanden:** {unknown}\n\n"
+            f"Befehlsteil: „{voice['tail']}“ · erkannt: `{known}` · "
+            "es wurde nichts gestartet.\n\n"
+            "Befehle stehen am Ende hinter „Serie“: Anzahl („zehn Bilder“), "
+            "Länge („130 Worte“), „Querformat“, „Hochformat“, „quadratisch“, "
+            "„sofort starten“, „los“ (auch mit Nummern). War kein Befehl gemeint: "
+            "anders formulieren oder `voice_commands` in der Chat-Steuerung "
+            "ausschalten."
+        )
+
     async def _series_entry(
         self,
         body: dict,
@@ -3529,10 +3871,12 @@ in der Info-Zeile vermerkt.
         h: dict,
         prompt: str,
         flags: dict,
+        pre_hints: Optional[list] = None,
     ):
         """Dispatch --serie (list phase, optionally rendering right away
-        with --nowait) and --los (render a list from the chat)."""
-        hints: list[str] = []
+        with --nowait) and --los (render a list from the chat).
+        pre_hints: notes from the spoken commands (v0.15.0)."""
+        hints: list[str] = list(pre_hints or [])
         if "serie" in flags and "los" in flags:
             # v0.14.1: --los next to --serie means "render right away",
             # like --nowait; a selection makes no sense for a new list
@@ -3619,6 +3963,15 @@ in der Info-Zeile vermerkt.
             )
             n = maximum
         return n
+
+    def _series_total(self, n: int, words: int) -> int:
+        """Total words of a list request when the total length hint applies
+        (target length set, n x words >= series_total_hint > 0), else 0.
+        (v0.15.0)"""
+        threshold = int(self.valves.series_total_hint or 0)
+        if words <= 0 or threshold <= 0 or n * words < threshold:
+            return 0
+        return n * words
 
     def _series_words(self, flags: dict, user_valves, hints: list) -> int:
         raw = flags.get("words")
@@ -3889,6 +4242,13 @@ in der Info-Zeile vermerkt.
             return err
         hints.extend(gen_notes)
         info.append(f"Prompt-Modell: {model}")
+        total = self._series_total(n, words)
+        if total:  # v0.15.0
+            info.append(
+                f"Gesamtlängen-Zusatz an das Prompt-Modell (~{total:,} Wörter)".replace(
+                    ",", "."
+                )
+            )
 
         list_block = self._series_list_block(
             ctx["name"], items, plan, words, vorgabe, nowait, used_bildart
@@ -4050,6 +4410,16 @@ in der Info-Zeile vermerkt.
         parts = [f"Brief: {vorgabe}", f"Number of prompts: {n}"]
         if words > 0:
             parts.append(f"Each prompt should be about {words} words long.")
+            total = self._series_total(n, words)
+            if total:  # v0.15.0
+                parts.append(
+                    SERIES_TOTAL_HINT.format(
+                        total=total,
+                        n=n,
+                        prompts="prompt" if n == 1 else "prompts",
+                        words=words,
+                    )
+                )
         parts.append(SERIES_FORMAT_BAN)
         if fixed:
             parts.append(f"Fixed requirements for every prompt: {fixed}")
@@ -4339,6 +4709,13 @@ in der Info-Zeile vermerkt.
             _p, serie_flags = self._parse_flags(
                 _strip_wrappers(self._message_text(serie_msg))
             )
+            # v0.15.0: a dictated --serie message carries its flags as
+            # spoken commands - read them the same way (no stop here)
+            if getattr(ctx["user_valves"], "voice_commands", False):
+                voice = _voice_parse(_p)
+                if voice is not None and not voice["unknown"]:
+                    for key, value in voice["flags"].items():
+                        serie_flags.setdefault(key, value)
         serie_layer = self._series_layer(serie_flags)
         los_layer = self._series_layer(flags)
         serie_layer.pop("words", None)

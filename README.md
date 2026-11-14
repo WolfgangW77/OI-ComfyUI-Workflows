@@ -31,7 +31,8 @@ Optionally the pipe shares the GPU with chat models through the
   needed – files are re-read when they change.
 - **Flags in the prompt.** `--ar`, `--mp`, `--batch`, `--steps`, `--seed`,
   `--cfg`, `--guidance`, `--no` (negative prompt), `--translate`, `--triggers`,
-  `--arauto`. `--`, the en dash and the em dash all work.
+  `--arauto`. Flags start with `--` or the em dash `—` (Open WebUI turns
+  `--` into it); since v0.15.0 the en dash `–` no longer starts a flag.
 - **Workflow-specific flags via markers.** Rename any node in ComfyUI to
   `PIPE_something` (or `PIPE_something:field`) and it becomes `--something`.
   Markers on model files (`PIPE_VAE`, `PIPE_MODEL`, `PIPE_CLIP`) accept a
@@ -57,7 +58,9 @@ Optionally the pipe shares the GPU with chat models through the
 - **Image series.** `brief --serie 10` lets a local LLM write ten English
   image prompts as an editable list in the chat; `--los` renders them one
   after another, each image appearing as soon as it is done. For image
-  workflows the LLM sees the input photo. See [Image series](#image-series).
+  workflows the LLM sees the input photo. Optionally driven by spoken
+  commands at the end of a dictation ("… Serie zehn Bilder Querformat
+  sofort starten"). See [Image series](#image-series).
 - **Image editing workflows.** Attach an image; if the workflow has an image
   input (`PIPE_IMAGE` or a `LoadImage` node), the image alone is enough – no
   prompt required.
@@ -257,7 +260,12 @@ count or the length, or raise `series_num_ctx`.
 
 **Length.** `--words N` or the user valve `series_words` (default 60,
 `0` = no target, at most 500) sets the approximate length per prompt in
-English words. The header shows target and achieved average.
+English words. The header shows target and achieved average. Models tend
+to shorten the single prompts of long lists, so from a total of
+`series_total_hint` words (prompts × length, default 600) the request
+adds that about N words are expected in total and that individual prompts
+must not be shortened to save space; with `show_prompt` the info line
+notes it.
 
 **Format.** First match wins: `--ar` (message or saved default) → input
 image → `aspect_ratio` user valve → the LLM picks one per prompt (from the
@@ -294,6 +302,41 @@ requirements for every prompt.
 - `--los` reuses the photo of the `--serie` message; a photo attached to
   `--los` replaces it.
 
+### Spoken commands
+
+With the user valve `voice_commands` (default off), a dictated text – e.g.
+via Open WebUI's Whisper speech-to-text, which often sets no punctuation –
+may end with commands after the signal word "Serie". The pipe turns them
+into flags, so a dictation can be sent without editing:
+
+| Spoken (German) | Flag |
+|---|---|
+| a number right after "Serie", "zehn Bilder", "10 Prompts", "5 Stück" | `--serie N` |
+| "130 Worte", "mit je 150 Wörtern" | `--words N` |
+| "Querformat" / "Hochformat" / "quadratisch" | `--ar 16:9` / `--ar 9:16` / `--ar 1:1` |
+| "sofort starten", "sofort" | `--nowait` |
+| "Serie los", "Serie los 1, 3 und 5" | `--los`, `--los 1,3,5` |
+
+```
+Eine Katze läuft über eine Straße Serie 10 Bilder 130 Worte quadratisch sofort starten
+```
+
+becomes the brief "Eine Katze läuft über eine Straße" with
+`--serie 10 --words 130 --ar 1:1 --nowait`.
+
+- Numbers as digits or German number words up to 500 ("hundertfünfzig").
+  Fillers ("und", "bitte", "mit", "je", "jeweils", "von", "im", "in",
+  "als", "lang", "Nummer") and punctuation are skipped.
+- The command part starts at the last "Serie" that is directly followed by
+  a command; everything after it must be understood. Otherwise the pipe
+  stops with a message naming the unknown words – nothing is started.
+  "Eine Serie von Leuchttürmen" stays normal text.
+- "Serie los" after a brief works like `--nowait`.
+- Typed flags win (with a note). The generated flags behave exactly like
+  typed ones and are listed as a note (`Sprachbefehle: …`); `--los` reads
+  the dictated `--serie` message the same way, so a spoken format still
+  applies.
+
 ## Valves
 
 **Admin valves** (gear icon on the function):
@@ -321,14 +364,16 @@ requirements for every prompt.
 | `series_system_control` | built-in | Instruction with input image, `--bildart control`: describe the subject of the photo |
 | `series_max` | `20` | Upper limit for `--serie N` (counts prompts, not images) |
 | `series_ar_options` | `1:1, 4:3, 3:4, 3:2, 2:3, 16:9, 9:16` | Formats the LLM may pick for workflows without `ResolutionSelector` |
+| `series_total_hint` | `600` | From this total (prompts × length in words) the list request asks the LLM not to shorten individual prompts; `0` = off |
 
-The pipe appends count, length, the format ban, fixed requirements and the
-allowed formats to the `series_system*` texts itself, so these valves only
+The pipe appends count, length, the total length hint, the format ban,
+fixed requirements and the allowed formats to the `series_system*` texts itself, so these valves only
 hold the actual instruction.
 
 **User valves** (slider icon in the chat): `aspect_ratio`, `megapixels`,
 `batch_size`, `steps`, `seed`, `translate`, `show_prompt`, `auto_ar`,
-`series_words` (prompt length for image series, default 60).
+`series_words` (prompt length for image series, default 60),
+`voice_commands` (spoken commands at the end of a dictation, default off).
 
 Precedence for the aspect ratio, first match wins: `--ar` in the message or
 saved defaults, then the attached image (if `auto_ar` is on), then the
