@@ -1,7 +1,7 @@
 """
 title: OI-ComfyUI-Workflows
 author: Wolfgang Weber (WolfgangW77 on github)
-version: 0.15.0
+version: 0.15.1
 license: MIT
 description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), image series from an LLM-written prompt list (--serie, --los; the LLM sees the input image of image workflows; optional spoken commands at the end of a dictation), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
 requirements: aiohttp
@@ -411,6 +411,14 @@ v0.15.0
 - Flags start with "--" or the em dash (U+2014, Open WebUI turns "--"
   into it) only; the en dash (U+2013) no longer starts a flag - it did
   so before, undocumented.
+
+v0.15.1
+- The JSON schema of the list request sets minItems and maxItems to the
+  requested count. Models stopped early on long lists (gemma4: 50
+  requested, 5 delivered; 46-49 gave 4); Ollama's structured output
+  enforces the count (verified live: a prompt asking for 3 with a schema
+  of 12 returned 12). The note "nur X von N Prompts geliefert" stays as
+  a safeguard.
 """
 
 import asyncio
@@ -4403,6 +4411,10 @@ in der Info-Zeile vermerkt.
                         "properties": item_props,
                         "required": required,
                     },
+                    # v0.15.1: exactly n entries - Ollama's grammar enforces
+                    # it, otherwise models stop early on long lists
+                    "minItems": n,
+                    "maxItems": n,
                 }
             },
             "required": ["prompts"],

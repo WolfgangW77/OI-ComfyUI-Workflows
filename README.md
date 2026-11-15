@@ -223,8 +223,11 @@ A cat in the four seasons, photo style --serie 10
 ```
 
 1. **Write the list.** `--serie N` (default 10, at most `series_max`) asks
-   `series_model` via `ollama_url` for N English prompts. The answer is
-   streamed and the status line counts the words as they arrive. The list
+   `series_model` via `ollama_url` for N English prompts. The JSON schema
+   of the request demands exactly N entries (Ollama's structured output
+   enforces it; models otherwise tend to stop early on long lists). The
+   answer is streamed and the status line counts the words as they
+   arrive. The list
    shows up as a numbered list with a header:
 
    ```
