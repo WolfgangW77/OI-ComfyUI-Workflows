@@ -1,9 +1,9 @@
 """
 title: OI-ComfyUI-Workflows
 author: Wolfgang Weber (WolfgangW77 on github)
-version: 0.15.1
+version: 0.16.0
 license: MIT
-description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), image series from an LLM-written prompt list (--serie, --los; the LLM sees the input image of image workflows; optional spoken commands at the end of a dictation), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
+description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), several input images per request for image workflows, image series from an LLM-written prompt list (--serie, --los; the LLM sees the input image of image workflows; optional spoken commands at the end of a dictation), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
 requirements: aiohttp
 
 Written with AI assistance (Claude by Anthropic); reviewed and maintained
@@ -419,6 +419,42 @@ v0.15.1
   enforces the count (verified live: a prompt asking for 3 with a schema
   of 12 returned 12). The note "nur X von N Prompts geliefert" stays as
   a safeguard.
+
+v0.16.0
+- Several input images per request: workflows with an image input
+  (PIPE_IMAGE / LoadImage) now process every attached image with the
+  same prompt and flags, one ComfyUI job per image - the workflows stay
+  unchanged. Before, only the first image was used and the rest noted
+  as ignored. Verified live: Open WebUI sends all attached images in
+  the last message.
+- The jobs go out one after another, not all into ComfyUI's queue at
+  once: the compute cap (timeout_seconds) counts from submission and
+  would otherwise include the queue wait; the stop button withdraws the
+  running job only. So the cap applies per image, as before per job.
+- All images are uploaded to ComfyUI before the first job; a failed
+  upload counts as a failure of that image only. If none can be
+  uploaded, the request ends with one message.
+- Format per image: without --ar every image gets the format of its own
+  photo (same precedence as for one image: --ar > image > aspect_ratio
+  user valve > workflow file).
+- Seed: same rule as in series - a fixed seed (--seed or the seed user
+  valve) applies to every image, otherwise each image gets a new one.
+- Output is streamed like a series: one GPU slot for all images, every
+  result appears as soon as it is done, headed "Bild 2/5". A failed
+  image is reported and the next one follows; 3 failures in a row
+  (SERIES_FAIL_STREAK) or ComfyUI unreachable end the request; the stop
+  button withdraws the running job, finished images stay. Translation
+  and trigger words run once for all images. A closing line counts the
+  results.
+- New admin valve max_images (default 8): more attached images than
+  that are refused as a whole, nothing is rendered. --serie and --los
+  take exactly one image on image workflows; two or more are refused
+  (for --los this includes the image taken over from the --serie
+  message).
+- Refactoring: translation (_translate_step), format from one image
+  (_ar_from_image, _auto_ar_on) and the defaults note of the info line
+  (_defaults_note) are shared helpers; the single-image path behaves as
+  before.
 """
 
 import asyncio
@@ -917,6 +953,14 @@ class Pipe:
         )
         max_batch: int = Field(
             default=8, description="Obergrenze für --batch, schützt vor VRAM-Unfällen."
+        )
+        max_images: int = Field(
+            default=8,
+            description=(
+                "Höchstzahl angehängter Bilder pro Anfrage bei Workflows mit "
+                "Bildeingang (je Bild ein Auftrag, gleicher Prompt). Mehr Bilder "
+                "lehnt die Pipe komplett ab."
+            ),
         )
         retry_on_error: bool = Field(
             default=True,
@@ -2311,6 +2355,23 @@ Vorgaben des Workflows.
 
 **Rangfolge:** Nachricht > Vorgaben > Chat-Steuerung > Workflow-Datei.
 
+## Mehrere Fotos auf einmal
+
+Bei Workflows mit Bildeingang dürfen an einer Nachricht mehrere Fotos
+hängen (wie viele, legt die Admin-Valve `max_images` fest, Standard 8).
+Jedes Foto wird mit
+demselben Prompt und denselben Kürzeln bearbeitet, eins nach dem
+anderen; jedes Ergebnis erscheint, sobald es fertig ist.
+
+- **Format:** ohne `--ar` bekommt jedes Ergebnis das Format seines Fotos.
+- **Seed:** ein fester Seed gilt für alle Fotos, sonst bekommt jedes
+  einen neuen.
+- Schlägt ein Foto fehl, geht es mit dem nächsten weiter; nach drei
+  Fehlschlägen in Folge ist Schluss. Der Stopp-Knopf beendet alles,
+  fertige Bilder bleiben stehen.
+- Sind mehr Fotos angehängt als erlaubt, rendert die Pipe gar nichts.
+- Bildserien (`--serie`, `--los`) nehmen genau ein Foto.
+
 ## Bildserien
 
 Ein Sprachmodell schreibt aus einer Vorgabe mehrere englische
@@ -2530,7 +2591,9 @@ in der Info-Zeile vermerkt.
             lines.append(f"- {label}: {'Knoten ' + h[key][0] if h.get(key) else '-'}")
         if h.get("image"):
             lines.append(
-                f"- Bildeingang: Knoten {h['image'][0]} (Foto an die Nachricht anhängen)"
+                f"- Bildeingang: Knoten {h['image'][0]} (Foto an die Nachricht anhängen; "
+                f"bis zu {self._max_images()} Fotos auf einmal, je Foto ein Auftrag mit "
+                "demselben Prompt)"
             )
             if self.valves.auto_ar_from_image:
                 lines.append(
@@ -2971,6 +3034,13 @@ in der Info-Zeile vermerkt.
                 bool(getattr(user_valves, "voice_commands", False)),
             )
 
+        # v0.16.0: several input images - more than max_images are refused
+        # as a whole, before anything is saved, uploaded or rendered
+        images_all = self._extract_images(body) if h.get("image") else []
+        if len(images_all) > self._max_images():
+            return self._too_many_images_text(len(images_all))
+        multi = len(images_all) > 1
+
         if not h.get("prompt"):
             return self._no_prompt_node_text(name)
         user_id = (__user__ or {}).get("id")
@@ -3104,10 +3174,12 @@ in der Info-Zeile vermerkt.
         seed = user_valves.seed
         if "seed" in flags and flags["seed"].lstrip("-").isdigit():
             seed = int(flags["seed"])
-        if seed < 0:
-            seed = random.randint(0, 2**53)
-        if self._set(wf, h.get("seed"), seed):
-            used.append(f"seed {seed}")
+        seed_fixed = seed  # v0.16.0: several images set their seed per job
+        if not multi:
+            if seed < 0:
+                seed = random.randint(0, 2**53)
+            if self._set(wf, h.get("seed"), seed):
+                used.append(f"seed {seed}")
 
         # --- Steps, cfg/guidance, marker nodes, batch (v0.14.0: shared) ---
         file_markers = self._apply_static(wf, h, flags, user_valves, used)
@@ -3166,6 +3238,34 @@ in der Info-Zeile vermerkt.
                         kopf = f"**{titel}** ({len(options)}):"
                     return kopf + "\n\n" + "\n".join(f"- `{o}`" for o in shown)
 
+                # --- Several input images (v0.16.0): upload all, then
+                # hand over to the streaming generator ---
+                if multi:
+                    if not h.get("outputs"):
+                        return self._no_output_text(name)
+                    return await self._multi_prepare(
+                        session,
+                        base,
+                        {
+                            "emitter": __event_emitter__,
+                            "metadata": __metadata__ or {},
+                            "user_id": user_id,
+                            "user_valves": user_valves,
+                            "name": name,
+                            "h": h,
+                            "wf": wf,
+                            "flags": flags,
+                            "prompt": prompt,
+                            "images": images_all,
+                            "used": used,
+                            "file_markers": file_markers,
+                            "seed_fixed": seed_fixed,
+                            "defaults_note": self._defaults_note(
+                                defaults, msg_flags, user_valves
+                            ),
+                        },
+                    )
+
                 # --- Image upload, format from image, validation, LoRAs,
                 # file markers (v0.14.0: shared with the series path) ---
                 images_in = self._extract_images(body)
@@ -3207,40 +3307,17 @@ in der Info-Zeile vermerkt.
                     )
 
                 # --- Translation ---
-                final_prompt = prompt
-                do_translate = user_valves.translate
-                if "translate" in flags:
-                    do_translate = self._coerce(flags["translate"], True)
-                if do_translate and self.valves.translate_model:
-                    await self._emit(__event_emitter__, "Prompt wird übersetzt ...")
-                    masked, kept = self._protect(prompt)
-                    english, err = await self._translate(
-                        session, masked, _slot_ctx["slot_id"]
-                    )
-                    if err:
-                        used.append(
-                            f"Übersetzung fehlgeschlagen ({err}), Original verwendet"
-                        )
-                    elif english:
-                        final_prompt = self._restore(english, kept)
-                        if final_prompt.strip() == prompt.strip():
-                            used.append(
-                                f"{self.valves.translate_model} hat den Text unverändert zurückgegeben"
-                            )
-                        else:
-                            used.append(f"übersetzt mit {self.valves.translate_model}")
-                    if h.get("negative") and flags.get("no"):
-                        neg_en, neg_err = await self._translate(
-                            session, flags["no"], _slot_ctx["slot_id"]
-                        )
-                        if neg_en and not neg_err:
-                            self._set(wf, h["negative"], neg_en)
-                elif do_translate:
-                    used.append(
-                        "Übersetzung angefordert, aber kein Modell in den Valves gesetzt"
-                    )
-                else:
-                    used.append("ohne Übersetzung")
+                final_prompt = await self._translate_step(
+                    session,
+                    prompt,
+                    flags,
+                    wf,
+                    h,
+                    user_valves,
+                    _slot_ctx["slot_id"],
+                    used,
+                    __event_emitter__,
+                )
 
                 # --- Trigger words of the active LoRAs ---
                 # v0.13.3: --triggers 0 (message or saved default) switches
@@ -3285,16 +3362,9 @@ in der Info-Zeile vermerkt.
                 out = "\n\n".join(res["blocks"])
                 if res["refined"]:
                     out += f"\n\n---\n\n**Verwendeter Prompt:**\n\n{res['refined']}"
-                if defaults and user_valves.show_prompt:
-                    parts = []
-                    for k, v in defaults.items():
-                        if k in msg_flags and str(msg_flags[k]) != str(v):
-                            parts.append(
-                                f"--{k} {msg_flags[k]} (Vorgabe {v} übersteuert)".rstrip()
-                            )
-                        else:
-                            parts.append(f"--{k} {v}".rstrip())
-                    used.append("Vorgaben: " + ", ".join(parts))
+                defaults_note = self._defaults_note(defaults, msg_flags, user_valves)
+                if defaults_note:
+                    used.append(defaults_note)
                 if user_valves.show_prompt and used:
                     out += "\n\n---\n\n*" + " · ".join(used) + "*"
                 return out
@@ -3444,13 +3514,18 @@ in der Info-Zeile vermerkt.
         name: str,
         emitter,
         handle_ar: bool = True,
+        upload: bool = True,
     ):
         """Upload the input image, derive the format from it, validate all
         values against ComfyUI, apply LoRAs and file markers.
         Returns (flags, ar_from_image, error text or None). With
-        handle_ar=False (series) the format is left to the series plan."""
+        handle_ar=False (series) the format is left to the series plan.
+        With upload=False (several images, v0.16.0) the caller uploads the
+        images and sets the format per image itself."""
         # --- Upload the attached image ---
-        if h.get("image"):
+        if not upload:
+            pass
+        elif h.get("image"):
             if images_in:
                 raw_img, fname = images_in[0]
                 await self._emit(emitter, "Bild wird hochgeladen ...")
@@ -3463,11 +3538,6 @@ in der Info-Zeile vermerkt.
                     )
                 self._set(wf, h["image"], ref)
                 used.append(f"Bild: {ref}")
-                if len(images_in) > 1:
-                    used.append(
-                        f"{len(images_in) - 1} weitere(s) Bild(er) ignoriert - "
-                        "dieser Workflow nimmt nur eins"
-                    )
             else:
                 return flags, "", self._needs_image_text(name)
         elif images_in:
@@ -3482,31 +3552,14 @@ in der Info-Zeile vermerkt.
         # image input, and only if switched on at every level.
         ar_from_image = ""
         if handle_ar:
-            auto_ar = self.valves.auto_ar_from_image and user_valves.auto_ar
-            if "arauto" in flags:
-                auto_ar = self._coerce(flags["arauto"], True)
+            auto_ar = self._auto_ar_on(flags, user_valves)
             if auto_ar and h.get("image") and images_in and "ar" not in flags:
-                size = self._image_size(images_in[0][0])
-                if not size:
-                    used.append("Format aus Bild: Bildgröße nicht lesbar, Vorgabe bleibt")
-                elif h.get("resolution"):
-                    options = await self._resolution_options(session, base)
-                    chosen = (
-                        self._nearest_ratio_option(options, *size) if options else None
-                    )
-                    if chosen:
-                        flags["ar"] = chosen
-                        ar_from_image = f"{size[0]}x{size[1]}"
-                    else:
-                        used.append(
-                            "Format aus Bild: keine Auswahlliste vom ResolutionSelector, "
-                            "Vorgabe bleibt"
-                        )
-                elif h.get("dimension_nodes"):
-                    flags["ar"] = f"{size[0]}:{size[1]}"
-                    ar_from_image = f"{size[0]}x{size[1]}"
-                else:
-                    used.append("Format aus Bild: Workflow hat keine setzbare Größe")
+                value, label = await self._ar_from_image(
+                    session, base, h, images_in[0][0], used
+                )
+                if value:
+                    flags["ar"] = value
+                    ar_from_image = label
 
             # --- Validate all values together once ---
             # The aspect ratio from the chat controls has to pass through
@@ -3537,6 +3590,117 @@ in der Info-Zeile vermerkt.
             self._set(wf, handle, flags[marker_name])
             used.append(f"{marker_name}: {flags[marker_name]}")
         return flags, ar_from_image, None
+
+    def _auto_ar_on(self, flags: dict, user_valves) -> bool:
+        """Format from the input image switched on? Admin valve, user valve,
+        --arauto (message or saved default). (v0.16.0: shared)"""
+        auto_ar = self.valves.auto_ar_from_image and user_valves.auto_ar
+        if "arauto" in flags:
+            auto_ar = self._coerce(flags["arauto"], True)
+        return bool(auto_ar)
+
+    async def _ar_from_image(self, session, base: str, h: dict, raw: bytes, used: list):
+        """Format derived from one input image: (value for --ar, label
+        "WxH"), or ("", "") with a note in used. v0.16.0: split out of
+        _prepare_in_session so that every image of a multi-image request
+        gets its own format."""
+        size = self._image_size(raw)
+        if not size:
+            used.append("Format aus Bild: Bildgröße nicht lesbar, Vorgabe bleibt")
+            return "", ""
+        if h.get("resolution"):
+            options = await self._resolution_options(session, base)
+            chosen = self._nearest_ratio_option(options, *size) if options else None
+            if chosen:
+                return chosen, f"{size[0]}x{size[1]}"
+            used.append(
+                "Format aus Bild: keine Auswahlliste vom ResolutionSelector, "
+                "Vorgabe bleibt"
+            )
+            return "", ""
+        if h.get("dimension_nodes"):
+            return f"{size[0]}:{size[1]}", f"{size[0]}x{size[1]}"
+        used.append("Format aus Bild: Workflow hat keine setzbare Größe")
+        return "", ""
+
+    async def _translate_step(
+        self,
+        session,
+        prompt: str,
+        flags: dict,
+        wf: dict,
+        h: dict,
+        user_valves,
+        slot_id: Optional[str],
+        used: list,
+        emitter,
+    ) -> str:
+        """Translate prompt (and --no) if switched on; returns the prompt to
+        use. The negative is written into wf directly. (v0.16.0: shared by
+        single image and several images)"""
+        final_prompt = prompt
+        do_translate = user_valves.translate
+        if "translate" in flags:
+            do_translate = self._coerce(flags["translate"], True)
+        if do_translate and self.valves.translate_model:
+            await self._emit(emitter, "Prompt wird übersetzt ...")
+            masked, kept = self._protect(prompt)
+            english, err = await self._translate(session, masked, slot_id)
+            if err:
+                used.append(f"Übersetzung fehlgeschlagen ({err}), Original verwendet")
+            elif english:
+                final_prompt = self._restore(english, kept)
+                if final_prompt.strip() == prompt.strip():
+                    used.append(
+                        f"{self.valves.translate_model} hat den Text unverändert zurückgegeben"
+                    )
+                else:
+                    used.append(f"übersetzt mit {self.valves.translate_model}")
+            if h.get("negative") and flags.get("no"):
+                neg_en, neg_err = await self._translate(session, flags["no"], slot_id)
+                if neg_en and not neg_err:
+                    self._set(wf, h["negative"], neg_en)
+        elif do_translate:
+            used.append("Übersetzung angefordert, aber kein Modell in den Valves gesetzt")
+        else:
+            used.append("ohne Übersetzung")
+        return final_prompt
+
+    @staticmethod
+    def _defaults_note(defaults: dict, msg_flags: dict, user_valves) -> str:
+        """'Vorgaben: ...' for the info line (only with show_prompt), with
+        overridden values marked. (v0.16.0: shared)"""
+        if not defaults or not user_valves.show_prompt:
+            return ""
+        parts = []
+        for k, v in defaults.items():
+            if k in msg_flags and str(msg_flags[k]) != str(v):
+                parts.append(f"--{k} {msg_flags[k]} (Vorgabe {v} übersteuert)".rstrip())
+            else:
+                parts.append(f"--{k} {v}".rstrip())
+        return "Vorgaben: " + ", ".join(parts)
+
+    def _max_images(self) -> int:
+        """Admin valve max_images, at least 1 (v0.16.0)."""
+        try:
+            return max(1, int(self.valves.max_images))
+        except (TypeError, ValueError):
+            return 8
+
+    def _too_many_images_text(self, count: int) -> str:
+        return (
+            f"**Zu viele Bilder:** {count} angehängt, erlaubt sind höchstens "
+            f"{self._max_images()} pro Anfrage (Admin-Valve `max_images`). "
+            "Es wurde nichts gerendert — bitte auf mehrere Nachrichten verteilen."
+        )
+
+    def _series_one_image_text(self, count: int) -> str:
+        return (
+            f"**Eine Bildserie nimmt genau ein Foto** — angehängt sind {count}. "
+            "Es wurde nichts gestartet.\n\nFür mehrere Fotos mit demselben Prompt "
+            "die Nachricht ohne `--serie`/`--los` schicken (höchstens "
+            f"{self._max_images()} Bilder)."
+        )
 
     def _active_triggers(self, wf: dict, h: dict, flags: dict, used: list) -> list:
         """Trigger words of the active LoRAs, unless --triggers 0. (v0.13.3,
@@ -3845,6 +4009,268 @@ in der Info-Zeile vermerkt.
                 + (await self._withdraw_open_job(base, open_job)),
                 "notes": notes,
             }
+
+    # ------------------------------------------------------------------
+    # Several input images, same prompt (v0.16.0)
+    # ------------------------------------------------------------------
+
+    async def _multi_prepare(self, session, base: str, m: dict):
+        """Several input images: validate once, upload every image to
+        ComfyUI, work out the format per image, then hand over to the
+        streaming generator. Errors before the first job come back as
+        plain text."""
+        h, wf, flags = m["h"], m["wf"], m["flags"]
+        user_valves, used = m["user_valves"], m["used"]
+        images_in = m["images"]
+        emitter = m["emitter"]
+
+        # Format: --ar (message/defaults) > image > aspect_ratio user valve
+        # > workflow file - like for one image, but the image part per image
+        auto_ar = "ar" not in flags and self._auto_ar_on(flags, user_valves)
+        if "ar" not in flags and user_valves.aspect_ratio:
+            # validated together with the rest; with auto_ar it is only the
+            # fallback for images whose size cannot be read
+            flags["ar"] = user_valves.aspect_ratio
+        flags, _ar, err = await self._prepare_in_session(
+            session,
+            base,
+            wf,
+            h,
+            flags,
+            user_valves,
+            images_in,
+            used,
+            m["file_markers"],
+            m["name"],
+            emitter,
+            handle_ar=False,
+            upload=False,
+        )
+        if err:
+            return err
+        fallback_ar = flags.pop("ar", "") if auto_ar else ""
+        fixed_ar = "" if auto_ar else flags.get("ar", "")
+
+        total = len(images_in)
+        items = []
+        last_err = None
+        for i, (raw_img, fname) in enumerate(images_in, start=1):
+            await self._emit(emitter, f"Bild {i}/{total} wird hochgeladen ...")
+            item = {
+                "ref": None,
+                "error": None,
+                "ratio": fixed_ar,
+                "ar_label": "",
+                "notes": [],
+            }
+            ref, up_err = await self._upload_image(session, base, raw_img, fname)
+            if up_err:
+                last_err = up_err
+                item["error"] = f"Upload zu ComfyUI fehlgeschlagen ({up_err})"
+            else:
+                item["ref"] = ref
+                if auto_ar:
+                    value, label = await self._ar_from_image(
+                        session, base, h, raw_img, item["notes"]
+                    )
+                    item["ratio"] = value or fallback_ar
+                    item["ar_label"] = label if value else ""
+            items.append(item)
+        if not any(it["ref"] for it in items):
+            return (
+                f"Keines der {total} Bilder konnte an ComfyUI übergeben werden: "
+                f"{last_err}"
+            )
+
+        return self._multi_render(
+            {
+                **m,
+                "flags": flags,
+                "items": items,
+                "megapixels": self._megapixels(flags, user_valves),
+                "slot_tag": str(
+                    m["metadata"].get("chat_id")
+                    or f"comfy-{random.randint(10000, 99999)}"
+                ),
+            }
+        )
+
+    async def _multi_render(self, r: dict):
+        """The rendering generator for several input images: ONE GPU slot,
+        translation once, then one job per image, one after another (the
+        compute cap counts per job from submission, so queueing all at
+        once would eat it up). Every result is yielded as soon as it is
+        there. Owns slot release and the closing status line, like
+        _series_render."""
+        emitter = r["emitter"]
+        h = r["h"]
+        items = r["items"]
+        total = len(items)
+        user_valves = r["user_valves"]
+        name = r["name"]
+        base = self.valves.comfy_url.rstrip("/")
+        used = list(r["used"])
+        started = time.monotonic()
+        slot_id = None
+        hb_task = None
+        state = {"lost": False}
+        ok_count = 0
+        image_count = 0
+        failed: list[int] = []
+        finished = 0
+        streak = 0
+        end_reason = None
+        cancelled = False
+        abort_note = None
+        try:
+            if self.valves.use_alpaka_proxy:
+                slot_id, slot_err = await self._acquire_slot(
+                    emitter, f"{name} ({total} Bilder)", r["slot_tag"], status_label=name
+                )
+                if slot_err:
+                    end_reason = "kein GPU-Slot"
+                    yield self._slot_error_text(slot_err)
+                    return
+                hb_task = asyncio.create_task(self._heartbeat_loop(slot_id, state))
+
+            timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                wf = r["wf"]
+                final_prompt = await self._translate_step(
+                    session,
+                    r["prompt"],
+                    r["flags"],
+                    wf,
+                    h,
+                    user_valves,
+                    slot_id,
+                    used,
+                    emitter,
+                )
+                triggers = self._active_triggers(wf, h, r["flags"], used)
+                if triggers:
+                    final_prompt = final_prompt.rstrip(" ,.") + ", " + ", ".join(triggers)
+                used.append(f"Prompt: {final_prompt}")
+
+                for i, item in enumerate(items, start=1):
+                    head = f"**Bild {i}/{total}**"
+                    if item["error"]:
+                        res = {"kind": "error", "short": item["error"], "notes": []}
+                    else:
+                        wf_i = copy.deepcopy(wf)
+                        self._set(wf_i, h["prompt"], final_prompt)
+                        self._set(wf_i, h["image"], item["ref"])
+                        seed = (
+                            r["seed_fixed"]
+                            if r["seed_fixed"] >= 0
+                            else random.randint(0, 2**53)
+                        )
+                        has_seed = self._set(wf_i, h.get("seed"), seed)
+                        res_notes: list[str] = []
+                        self._apply_resolution(
+                            wf_i,
+                            h,
+                            item["ratio"],
+                            r["megapixels"],
+                            item["ar_label"],
+                            res_notes,
+                        )
+                        label = f"{name}: Bild {i}/{total}"
+                        res = await self._render_job(
+                            session,
+                            base,
+                            wf_i,
+                            h,
+                            label,
+                            emitter,
+                            r["user_id"],
+                            fetch_status=f"{label} wird abgeholt ...",
+                        )
+                    finished = i
+                    if res["kind"] == "ok":
+                        ok_count += 1
+                        image_count += len(res["blocks"])
+                        streak = 0
+                        block = head + "\n\n" + "\n\n".join(res["blocks"])
+                        if res["refined"]:
+                            block += f"\n\n**Verwendeter Prompt:** {res['refined']}"
+                        if user_valves.show_prompt:
+                            line = [f"Bild: {item['ref']}"]
+                            if has_seed:
+                                line.append(f"Seed {seed}")
+                            line += res_notes + item["notes"] + res["notes"]
+                            block += "\n\n*" + " · ".join(line) + "*"
+                        yield block + "\n\n"
+                        continue
+
+                    failed.append(i)
+                    streak += 1
+                    block = f"{head} · fehlgeschlagen – {res['short']}"
+                    if res.get("detail"):
+                        block += f"\n\n```\n{res['detail']}\n```"
+                    yield block + "\n\n"
+                    if res["kind"] == "conn":
+                        end_reason = "ComfyUI nicht erreichbar"
+                        break
+                    if streak >= SERIES_FAIL_STREAK:
+                        end_reason = f"{SERIES_FAIL_STREAK} Fehlschläge in Folge"
+                        break
+
+            elapsed = _duration(time.monotonic() - started)
+            done_text = f"{ok_count} von {total} Bildern"
+            if image_count != ok_count:
+                done_text += f" ({image_count} Ergebnisbilder)"
+            if end_reason:
+                summary = (
+                    f"**Abgebrochen** nach Bild {finished}/{total} – {end_reason} · "
+                    f"{done_text} · {elapsed}"
+                )
+            else:
+                summary = f"**Fertig:** {done_text}"
+                if failed:
+                    summary += (
+                        f" · {len(failed)} fehlgeschlagen (Bild "
+                        + ", ".join(str(f) for f in failed)
+                        + ")"
+                    )
+                summary += f" · {elapsed}"
+            if r.get("defaults_note"):
+                used.append(r["defaults_note"])
+            if state.get("lost"):
+                used.append(
+                    "Hinweis: die GPU-Slot-Lease war zwischenzeitlich verfallen "
+                    "(Alpaka neu gestartet?) — die Aufträge liefen trotzdem weiter"
+                )
+            out = "---\n\n" + summary
+            if user_valves.show_prompt and used:
+                out += "\n\n*" + " · ".join(used) + "*"
+            yield out
+        except asyncio.CancelledError as e:
+            cancelled = True
+            abort_note = getattr(e, "comfy_note", None)
+            raise
+        except GeneratorExit:
+            # The consumer went away (e.g. connection closed)
+            cancelled = True
+            raise
+        finally:
+            if hb_task is not None:
+                hb_task.cancel()
+            if slot_id:
+                # shield: the release must go through even on a second stop
+                await asyncio.shield(self._release_slot(slot_id))
+            if cancelled:
+                text = f"Abgebrochen nach Bild {finished}/{total}"
+                if abort_note:
+                    text += f" — {abort_note}"
+            elif end_reason:
+                text = f"Abgebrochen nach Bild {finished}/{total} — {end_reason}"
+            else:
+                text = (
+                    f"Fertig: {ok_count}/{total} Bilder in "
+                    f"{_duration(time.monotonic() - started)}"
+                )
+            await self._emit(emitter, text, done=True)
 
     # ------------------------------------------------------------------
     # Image series (v0.14.0)
@@ -4164,6 +4590,9 @@ in der Info-Zeile vermerkt.
         # prompt is written - otherwise the LLM writes about nothing
         if h.get("image") and not images_in:
             return self._needs_image_text(ctx["name"])
+        # v0.16.0: a series takes exactly one photo
+        if h.get("image") and len(images_in) > 1:
+            return self._series_one_image_text(len(images_in))
 
         n = self._series_count(flags.get("serie", ""), hints)
         nowait = "nowait" in flags
@@ -4750,6 +5179,9 @@ in der Info-Zeile vermerkt.
         images_in = self._extract_images(ctx["body"])
         if not images_in and serie_msg is not None:
             images_in = self._images_from_message(serie_msg)
+        # v0.16.0: a series takes exactly one photo
+        if ctx["h"].get("image") and len(images_in) > 1:
+            return self._series_one_image_text(len(images_in))
 
         plan = await self._series_ar_plan(
             ctx["h"], eff, ar_from_msg, ctx["user_valves"], images_in

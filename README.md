@@ -64,6 +64,13 @@ Optionally the pipe shares the GPU with chat models through the
 - **Image editing workflows.** Attach an image; if the workflow has an image
   input (`PIPE_IMAGE` or a `LoadImage` node), the image alone is enough – no
   prompt required.
+- **Several images at once.** Attach up to `max_images` (default 8) images
+  to one message: each is processed with the same prompt and flags, one
+  ComfyUI job after another, and every result appears as soon as it is
+  done. Each image gets its own format (unless `--ar` is set); a fixed seed
+  applies to all, otherwise each gets a new one. A failed image is reported
+  and the next one follows; three failures in a row end the request. More
+  images than allowed are refused as a whole. The workflows need no change.
 - **Aspect ratio from the image.** For workflows with an image input the
   output format follows the attached image: the pipe reads its dimensions
   and picks the closest entry from the `ResolutionSelector` (or sets
@@ -291,6 +298,9 @@ requirements for every prompt.
 
 - The photo belongs on the `--serie` message; without it the pipe stops
   right away, before any prompt is written.
+- A series takes exactly one photo: two or more on the `--serie` or
+  `--los` message are refused (for several photos with the same prompt,
+  send the message without `--serie`).
 - The pipe first checks via Ollama's `/api/show` whether `series_model`
   can process images. If not, it says so and writes no list; if the check
   itself fails, the image goes anyway with a note.
@@ -349,6 +359,7 @@ becomes the brief "Eine Katze läuft über eine Straße" with
 | `comfy_url` | `http://host.docker.internal:8189` | ComfyUI base URL |
 | `timeout_seconds` | `900` | Compute cap from submission; on expiry the job is withdrawn from ComfyUI. `0` = no cap. Waiting for the GPU slot does not count; fixed transport timeouts (connect 10 s, read 120 s) detect dead connections |
 | `max_batch` | `8` | Upper limit for `--batch` |
+| `max_images` | `8` | Maximum number of attached images per request for image workflows (one job per image); more are refused as a whole. Image series take exactly one image |
 | `retry_on_error` | on | Retry once on a ComfyUI execution error |
 | `store_images_as_files` | on | Store images in Open WebUI's file storage instead of inline Base64 |
 | `ollama_url` | `http://host.docker.internal:11435` | Base URL for translation – Alpaka by default; without Alpaka Ollama directly (usually port 11434) |
