@@ -1,7 +1,7 @@
 """
 title: OI-ComfyUI-Workflows
 author: Wolfgang Weber (WolfgangW77 on github)
-version: 0.16.0
+version: 0.16.1
 license: MIT
 description: Exposes every API-format ComfyUI workflow in a directory as its own model - prompt flags (--ar, --no, --steps ...), several input images per request for image workflows, image series from an LLM-written prompt list (--serie, --los; the LLM sees the input image of image workflows; optional spoken commands at the end of a dictation), optional prompt translation via Ollama, GPU sharing via the Alpaka Ollama Log Proxy (slot v5.3+, --handover v5.4+).
 requirements: aiohttp
@@ -455,6 +455,26 @@ v0.16.0
   (_ar_from_image, _auto_ar_on) and the defaults note of the info line
   (_defaults_note) are shared helpers; the single-image path behaves as
   before.
+
+v0.16.1
+- Queue info while the prompt list waits: the list request of --serie
+  goes through Alpaka's normal queue (no GPU slot), and until its first
+  word arrived the status line only said "Serie: Prompts werden erstellt
+  ...". The Ollama-Status filter cannot help there - it skips pipe models
+  on purpose and finds its requests by their x_owui_tag. Now the pipe
+  puts its own x_owui_tag on the list request (top level; Alpaka strips
+  it before Ollama sees it, also for /api/generate - checked in proxy
+  v5.4) and polls /proxy/status every 1.5 s until the first word or the
+  thinking phase arrives. The status line then shows the usual filter
+  text with "Serie: " in front - "Serie: Warteschlange: noch 1 laufende
+  und 2 wartende Anfragen vor deiner ...", "Serie: Deine Anfrage ist als
+  Nächstes dran ...", "Serie: Modell wird geladen, das dauert ein paar
+  Sekunden ...". Afterwards the word count takes over as before.
+- Only with use_alpaka_proxy on (without Alpaka the request goes to
+  Ollama directly and gets no tag).
+- The texts are a copy of _queue_text/_phase_text of the Ollama-Status
+  filter v0.13.2 (ALPAKA_* constants, _alpaka_queue_text,
+  _alpaka_phase_text). If the filter's wording changes, update them here.
 """
 
 import asyncio
@@ -511,6 +531,22 @@ SERIES_FLAGS = {"serie", "nowait", "los"}  # commands, never stored as defaults
 SERIES_DEFAULT_COUNT = 10  # --serie without a number
 SERIES_WORDS_MAX = 500  # upper bound for --words / series_words
 SERIES_FAIL_STREAK = 3  # failed images in a row that end a series
+
+# v0.16.1: queue texts of the Ollama-Status filter (v0.13.2), copied so
+# that the series list request shows the usual status line. Keep in sync
+# with the filter.
+ALPAKA_TAG_FIELD = "x_owui_tag"
+ALPAKA_TASK_LABELS = {
+    "title_generation": "erzeugt gerade noch den Chat-Titel",
+    "tags_generation": "erzeugt gerade noch Chat-Schlagwörter",
+    "follow_up_generation": "erzeugt gerade noch Folgefragen",
+    "query_generation": "erzeugt gerade noch eine Suchanfrage",
+    "autocomplete_generation": "erzeugt gerade noch eine Vervollständigung",
+}
+ALPAKA_MSG_LOADING = "Modell wird geladen, das dauert ein paar Sekunden ..."
+ALPAKA_MSG_THINKING = "Deine Antwort wird generiert (das Modell denkt nach) ..."
+ALPAKA_MSG_GENERATING = "Deine Antwort wird generiert ..."
+ALPAKA_MSG_DISPATCHED = "Anfrage zugestellt, warte auf das erste Token ..."
 # v0.14.1: appended by the pipe to every list request (not part of the
 # valve texts, so it also reaches installations with older saved texts)
 SERIES_FORMAT_BAN = (
@@ -4877,6 +4913,14 @@ in der Info-Zeile vermerkt.
         }
         if image_b64:
             base["images"] = [image_b64]
+        # v0.16.1: own tag so that the queue position can be found in
+        # Alpaka's /proxy/status (Alpaka strips it before Ollama)
+        queue_tag = None
+        if v.use_alpaka_proxy:
+            queue_tag = "comfy-serie-" + "".join(
+                random.choice("0123456789abcdef") for _ in range(12)
+            )
+            base[ALPAKA_TAG_FIELD] = queue_tag
         if v.series_num_ctx and v.series_num_ctx > 0:
             base["options"] = {"num_ctx": int(v.series_num_ctx)}
         # Same order as the translation: thinking off, then without the
@@ -4901,7 +4945,7 @@ in der Info-Zeile vermerkt.
             for payload in attempts:
                 try:
                     text, done_reason, finished, err = await self._series_stream(
-                        session, url, payload, emitter
+                        session, url, payload, emitter, queue_tag
                     )
                 except asyncio.CancelledError:
                     raise
@@ -4928,10 +4972,141 @@ in der Info-Zeile vermerkt.
             [],
         )
 
-    async def _series_stream(self, session, url: str, payload: dict, emitter):
+    async def _series_stream(
+        self, session, url: str, payload: dict, emitter, queue_tag: Optional[str] = None
+    ):
         """One streamed /api/generate call. Returns (text, done_reason,
         finished, error). The status line shows a rough word count every
-        1.5 s (JSON keys count as words too - hence the '~')."""
+        1.5 s (JSON keys count as words too - hence the '~').
+        v0.16.1: with queue_tag, a ticker shows the Alpaka queue position
+        until the first word (or the thinking phase) arrives."""
+        ticker = None
+        if queue_tag:
+            ticker = asyncio.create_task(self._series_queue_ticker(queue_tag, emitter))
+        try:
+            return await self._series_stream_inner(session, url, payload, emitter, ticker)
+        finally:
+            if ticker is not None:
+                ticker.cancel()
+
+    async def _series_queue_ticker(self, tag: str, emitter):
+        """v0.16.1: poll /proxy/status and show the usual queue/phase
+        text of the Ollama-Status filter for the list request. Runs until
+        it is cancelled (first word, thinking, end of the request)."""
+        last = None
+        try:
+            while True:
+                st, err = await self._proxy_get("/proxy/status", timeout_s=3)
+                if st and not err:
+                    text = self._alpaka_wait_text(tag, st)
+                    if text and text != last:
+                        last = text
+                        await self._emit(emitter, f"Serie: {text}")
+                await asyncio.sleep(1.5)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass  # display only - never disturbs the request
+
+    def _alpaka_wait_text(self, tag: str, st: dict) -> Optional[str]:
+        """Own tag waiting -> queue text, own tag dispatched -> phase
+        text, otherwise None (keep the current line)."""
+        queue = st.get("queue") or []
+        mine = next((q for q in queue if q.get("tag") == tag), None)
+        if mine is not None:
+            return self._alpaka_queue_text(mine, st)
+        inflight = st.get("inflight") or {}
+        if inflight.get("tag") == tag:
+            entry = (st.get("models") or {}).get(inflight.get("model"))
+            return self._alpaka_phase_text(entry)
+        return None
+
+    @staticmethod
+    def _alpaka_queue_text(mine: dict, st: dict) -> str:
+        """Copy of Filter._queue_text (Ollama-Status v0.13.2)."""
+        pos = int(mine.get("position") or 0)
+        guaranteed = bool(mine.get("guaranteed"))
+        inflight = st.get("inflight") or {}
+        running_models = st.get("models") or {}
+        running = 1 if (inflight or running_models) else 0
+        running_is_task = bool(inflight.get("task"))
+        queue = st.get("queue") or []
+        ahead = [q for q in queue if int(q.get("position") or 0) < pos]
+        wait_req = sum(1 for q in ahead if not q.get("task"))
+        wait_task = len(ahead) - wait_req
+
+        if running == 0 and not ahead:
+            text = "Deine Anfrage ist als Nächstes dran"
+            if guaranteed:
+                text += " (garantierter Platz)"
+            return text + " ..."
+
+        def group(run_here: bool, wait: int, noun_sg: str, noun_pl: str):
+            parts = []
+            if run_here:
+                parts.append("1 laufende")
+            if wait:
+                parts.append(f"{wait} wartende")
+            if not parts:
+                return None
+            noun = noun_pl if (wait > 1) else noun_sg
+            return " und ".join(parts) + " " + noun
+
+        g_req = group(running and not running_is_task, wait_req, "Anfrage", "Anfragen")
+        g_task = group(
+            running and running_is_task, wait_task, "Hilfsaufgabe", "Hilfsaufgaben"
+        )
+        groups = [g for g in (g_req, g_task) if g]
+        if len(groups) > 1:
+            task_total = wait_task + (1 if running_is_task else 0)
+            bits = []
+            if running:
+                bits.append("1 laufend")
+            if wait_req + wait_task:
+                bits.append(f"{wait_req + wait_task} wartend")
+            text = (
+                f"Warteschlange: {', '.join(bits)} "
+                f"(davon {task_total} Hilfsaufgabe"
+                f"{'n' if task_total != 1 else ''})"
+            )
+        else:
+            tail = "vor deiner Anfrage" if groups[-1] is g_task else "vor deiner"
+            text = f"Warteschlange: noch {groups[0]} {tail}"
+
+        if running:
+            task = inflight.get("task")
+            entry = running_models.get(inflight.get("model")) if inflight else None
+            if entry is None and running_models:
+                entry = next(iter(running_models.values()))
+            loading = bool(entry) and entry.get("state") == "loading"
+            if task:
+                label = ALPAKA_TASK_LABELS.get(
+                    task, f"erledigt gerade noch eine Hilfsaufgabe ({task})"
+                )
+                text += f" — OWUI {label}"
+            elif loading:
+                text += " (Modell wird geladen)"
+        if guaranteed:
+            text += " — garantierter Platz gesichert"
+        return text + " ..."
+
+    @staticmethod
+    def _alpaka_phase_text(entry: Optional[dict]) -> str:
+        """Copy of Filter._phase_text (Ollama-Status v0.13.2)."""
+        state = (entry or {}).get("state")
+        if state == "loading":
+            return ALPAKA_MSG_LOADING
+        if state == "dispatched":
+            return ALPAKA_MSG_DISPATCHED
+        if state == "thinking":
+            return ALPAKA_MSG_THINKING
+        return ALPAKA_MSG_GENERATING
+
+    async def _series_stream_inner(
+        self, session, url: str, payload: dict, emitter, ticker
+    ):
+        """The streaming loop of _series_stream; stops the queue ticker as
+        soon as the model answers (v0.16.1)."""
         async with session.post(url, json=payload) as resp:
             if resp.status != 200:
                 detail = (await resp.text())[:300].strip()
@@ -4956,6 +5131,10 @@ in der Info-Zeile vermerkt.
                     chunks.append(piece)
                 if obj.get("thinking"):
                     thinking = True
+                if ticker is not None and (chunks or thinking):
+                    # the model answers - the word count takes over
+                    ticker.cancel()
+                    ticker = None
                 if obj.get("done"):
                     finished = True
                     done_reason = obj.get("done_reason")

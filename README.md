@@ -234,7 +234,11 @@ A cat in the four seasons, photo style --serie 10
    of the request demands exactly N entries (Ollama's structured output
    enforces it; models otherwise tend to stop early on long lists). The
    answer is streamed and the status line counts the words as they
-   arrive. The list
+   arrive. While the request still waits in Alpaka's queue, the status
+   line shows the usual queue text of the Ollama-Status filter
+   (`Serie: Warteschlange: noch 1 laufende Anfrage vor deiner ...`);
+   the pipe tags the request with `x_owui_tag` for that (only with
+   `use_alpaka_proxy` on). The list
    shows up as a numbered list with a header:
 
    ```
